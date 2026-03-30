@@ -1,0 +1,1111 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="chrome=1" />
+    <title>
+        HPX Parallel Scheduler | Implementation Guide Based on P2079R10
+    </title>
+    <link rel="icon" href="./img/stellar_group_little_icon.png" />
+    <link rel="stylesheet" href="stylesheets/styles.css" />
+    <link rel="stylesheet" href="stylesheets/pygment_trac.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/vivus/0.4.6/vivus.min.js"></script>
+    <meta name="viewport" content="width=device-width" />
+    <!--[if lt IE 9]>
+        <script src="//html5shiv.googlecode.com/svn/trunk/html5.js"></script>
+    <![endif]-->
+</head>
+
+<body>
+    <div class="wrapper">
+        <!-- HEADER SECTION -->
+        <header>
+            <a href="https://github.com/charan-003">
+                <img src="./img/stellar_group_icon.svg" width="300px" alt="Sai Charan - C++ Developer" />
+            </a>
+        </header>
+
+        <!-- MAIN CONTENT SECTION -->
+        <section>
+            <!-- TITLE AND METADATA -->
+            <h1>HPX Parallel Scheduler Implementation</h1>
+            <h3>
+                <strong>Based on P2079R10 Parallel Scheduler Proposal</strong>
+                @
+                <strong>2025</strong>
+            </h3>
+
+            <p>
+                <span class="nameContainer">
+                    <strong>Sai Charan Arvapally</strong>
+                    <a href="https://www.github.com/charan-003" target="_blank">
+                        <img src="./img/github.svg" width="15px" />
+                    </a>
+                </span>
+                <br />
+                University of Alberta, Canada
+                <br />
+                <a href="https://github.com/STEllAR-GROUP/hpx/pull/6746" target="_blank">View Project on GitHub</a>
+            </p>
+
+            <!-- ABSTRACT SECTION -->
+            <h2>Abstract</h2>
+            <p>
+                This article explains how we implemented a parallel scheduler for HPX based on the P2079R10
+                proposal. The parallel scheduler provides a shared execution context for parallel work,
+                solving critical problems like oversubscription and poor composability in traditional
+                thread-based parallelism. We show how HPX's work-stealing runtime naturally maps to the
+                parallel scheduler model, delivering high performance and excellent scalability.
+            </p>
+
+            <p style="background: #f0f8ff; padding: 1em; border-left: 4px solid #0066cc; margin: 1.5em 0;">
+                <strong>📖 Deep Dive:</strong> Want to understand the internal architecture and how scheduling actually
+                works?
+                Check out the <a href="blogpost_internals.html" style="font-weight: bold; color: #0066cc;">Parallel
+                    Scheduler Internals</a> page
+                for a comprehensive explanation of the type hierarchy, execution policies, task scheduling flow, and
+                domain transformation pipeline.
+            </p>
+
+            <!-- TABLE OF CONTENTS -->
+            <h2>Table of Contents</h2>
+            <ul>
+                <li><a href="#introduction">Introduction</a></li>
+                <li><a href="#motivation">Before: How Things Worked Earlier</a></li>
+                <li><a href="#design-overview">The Parallel Scheduler Concept (P2079R10)</a></li>
+                <li><a href="#technical-specification">Our Implementation Using HPX</a></li>
+                <li><a href="#implementation-guidance">Before vs After: Key Changes</a></li>
+                <li><a href="#real-world-examples">How It Works in Practice</a></li>
+                <li><a href="#under-the-hood">Under the Hood: How Scheduling is Implemented</a></li>
+                <li><a href="#performance-considerations">Why This Matters</a></li>
+                <li><a href="#design-rationale">Design Decisions and Replaceability</a></li>
+                <li><a href="#best-practices">Best Practices</a></li>
+                <li><a href="#conclusion">Conclusion</a></li>
+                <li><a href="#special-thanks">Special Thanks</a></li>
+                <li><a href="#references">References</a></li>
+            </ul>
+
+            <!-- INTRODUCTION SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="introduction" style="color: #222; font-weight: bold;">Introduction</h2>
+            <p>
+                Modern C++ applications need efficient parallel execution. For years, developers struggled
+                with manual thread management, thread pools, and executors that didn't work well together.
+                The C++ execution model has evolved significantly, especially with the introduction of
+                senders and receivers in P2300. The parallel scheduler proposal (P2079R10) takes this
+                further by defining a standard way to execute parallel work efficiently.
+            </p>
+            <p>
+                This article explains how we built a parallel scheduler for HPX that follows the P2079R10
+                design. We'll show you what problems it solves, how it works, and why it matters for
+                real-world C++ applications.
+            </p>
+
+            <!-- MOTIVATION SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="motivation" style="color: #222; font-weight: bold;">Motivation</h2>
+
+            <h3 style="color: #555; font-weight: normal;">Traditional Thread-Based Parallelism</h3>
+            <p>
+                Before modern execution models, C++ developers had limited options for parallel execution:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Old approach: Manual thread management</span>
+<span style="color: #080; font-weight: bold">void</span><span style="color: #BBB"> </span><span style="color: #06B; font-weight: bold">process_data</span>(std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span><span style="color: #339; font-weight: bold">int</span><span style="color: #333">&gt;&amp;</span><span style="color: #BBB"> </span>data)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span>std<span style="color: #333">::</span><span style="color: #080; font-weight: bold">thread</span><span style="color: #333">&gt;</span><span style="color: #BBB"> </span>threads;
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">int</span><span style="color: #BBB"> </span>num_threads<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>std<span style="color: #333">::</span><span style="color: #080; font-weight: bold">thread</span><span style="color: #333">::</span>hardware_concurrency();
+<span style="color: #BBB">  </span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #080; font-weight: bold">int</span><span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;<span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">&lt;</span><span style="color: #BBB"> </span>num_threads;<span style="color: #BBB"> </span><span style="color: #333">++</span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">    </span>threads.emplace_back([<span style="color: #333">&amp;</span>,<span style="color: #BBB"> </span>i]()<span style="color: #BBB"> </span>{
+<span style="color: #BBB">      </span><span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #339; font-weight: bold">size_t</span><span style="color: #BBB"> </span>j<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>i;<span style="color: #BBB"> </span>j<span style="color: #BBB"> </span><span style="color: #333">&lt;</span><span style="color: #BBB"> </span>data.size();<span style="color: #BBB"> </span>j<span style="color: #BBB"> </span><span style="color: #333">+=</span><span style="color: #BBB"> </span>num_threads)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">        </span>data[j]<span style="color: #BBB"> </span><span style="color: #333">*=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">2</span>;<span style="color: #BBB"> </span><span style="color: #888">// Process each element</span>
+<span style="color: #BBB">      </span>}
+<span style="color: #BBB">    </span>});
+<span style="color: #BBB">  </span>}
+<span style="color: #BBB">  </span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #080; font-weight: bold">auto</span><span style="color: #333">&amp;</span><span style="color: #BBB"> </span>t<span style="color: #BBB"> </span><span style="color: #333">:</span><span style="color: #BBB"> </span>threads)<span style="color: #BBB"> </span>t.join();
+}
+</pre>
+            </div>
+
+            <p><strong>Major Problems:</strong></p>
+            <ul>
+                <li><strong>Oversubscription:</strong> Creating too many threads wastes resources and hurts performance
+                </li>
+                <li><strong>Poor composability:</strong> Different libraries create their own thread pools, leading to
+                    conflicts</li>
+                <li><strong>Nested parallelism issues:</strong> Parallel code calling parallel code creates thread
+                    explosion</li>
+                <li><strong>No unified execution context:</strong> Each component manages its own threads independently
+                </li>
+                <li><strong>Manual synchronization:</strong> Developers must handle all coordination themselves</li>
+            </ul>
+
+            <h3>Why Earlier Executor Designs Failed</h3>
+            <p>
+                Early attempts at standardizing executors (like <code>static_thread_pool</code>) had limitations:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Old static_thread_pool approach</span>
+<span style="color: #080; font-weight: bold">static_thread_pool</span><span style="color: #BBB"> </span>pool(<span style="color: #00D; font-weight: bold">4</span>);<span style="color: #BBB"> </span><span style="color: #888">// Fixed number of threads</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>ex<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>pool.executor();
+
+<span style="color: #888">// Problem 1: Each library creates its own pool</span>
+<span style="color: #080; font-weight: bold">static_thread_pool</span><span style="color: #BBB"> </span>library_a_pool(<span style="color: #00D; font-weight: bold">4</span>);
+<span style="color: #080; font-weight: bold">static_thread_pool</span><span style="color: #BBB"> </span>library_b_pool(<span style="color: #00D; font-weight: bold">4</span>);
+<span style="color: #888">// Now you have 8 threads competing for 4 cores!</span>
+
+<span style="color: #888">// Problem 2: Nested parallelism doesn't work well</span>
+<span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;<span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">&lt;</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">100</span>;<span style="color: #BBB"> </span><span style="color: #333">++</span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>ex.execute([<span style="color: #333">&amp;</span>]()<span style="color: #BBB"> </span>{
+<span style="color: #BBB">    </span><span style="color: #888">// Inner parallel work blocks outer threads</span>
+<span style="color: #BBB">    </span>parallel_algorithm(data);<span style="color: #BBB"> </span><span style="color: #888">// Deadlock risk!</span>
+<span style="color: #BBB">  </span>});
+}
+</pre>
+            </div>
+
+            <p><strong>Key Issues:</strong></p>
+            <ul>
+                <li><strong>No resource sharing:</strong> Each thread pool is isolated</li>
+                <li><strong>Inflexible:</strong> Fixed thread counts don't adapt to workload</li>
+                <li><strong>Deadlock prone:</strong> Nested parallelism can exhaust thread pool</li>
+                <li><strong>Not portable:</strong> No standard way to integrate with OS thread pools</li>
+            </ul>
+
+            <h3>The Evolution: Senders and Receivers</h3>
+            <p>
+                The C++ execution model evolved with P2300, introducing senders and receivers. This provided
+                better composability, but still lacked a standard parallel execution context:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// P2300 senders/receivers - better, but still missing something</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>work<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>just(<span style="color: #00D; font-weight: bold">42</span>)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>then([](int<span style="color: #BBB"> </span>x)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">return</span><span style="color: #BBB"> </span>x<span style="color: #BBB"> </span><span style="color: #333">*</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">2</span>;<span style="color: #BBB"> </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">1000</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i,<span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>val)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #888">/* work */</span><span style="color: #BBB"> </span>});
+
+<span style="color: #888">// Question: WHERE does this bulk work execute?</span>
+<span style="color: #888">// Answer: We need a parallel scheduler!</span>
+</pre>
+            </div>
+
+            <p><strong>What Was Still Missing:</strong></p>
+            <ul>
+                <li><strong>Shared execution context:</strong> No standard way to share thread resources</li>
+                <li><strong>Parallel forward progress:</strong> No guarantee that parallel work makes progress</li>
+                <li><strong>System integration:</strong> No way to use OS-provided thread pools</li>
+                <li><strong>Replaceability:</strong> Applications couldn't customize the execution backend</li>
+            </ul>
+
+            <!-- DESIGN OVERVIEW SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="design-overview" style="color: #222; font-weight: bold;">The Parallel Scheduler Concept (P2079R10)
+            </h2>
+
+            <h3 style="color: #555; font-weight: normal;">Core Idea</h3>
+
+            <p>
+                P2079R10 proposes a <strong>parallel scheduler</strong> that provides a shared execution context
+                for parallel work. Think of it as a system-wide thread pool that all components can use:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Get the system's parallel scheduler</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// Use it for parallel work</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>work<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">10000</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #888">/* parallel work */</span><span style="color: #BBB"> </span>});
+
+<span style="color: #888">// All libraries share the same execution context!</span>
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Key Design Goals</h3>
+            <ol>
+                <li><strong>Avoid Oversubscription:</strong> Single shared thread pool prevents too many threads</li>
+                <li><strong>Parallel Forward Progress:</strong> Guarantees that parallel work makes progress without
+                    deadlocks</li>
+                <li><strong>System Integration:</strong> Can use OS thread pools (like Windows thread pool, Grand
+                    Central Dispatch)</li>
+                <li><strong>Portability:</strong> Works across different platforms and hardware</li>
+                <li><strong>Replaceability:</strong> Applications can provide custom implementations</li>
+            </ol>
+
+            <h3 style="color: #555; font-weight: normal;">What is "Parallel Forward Progress"?</h3>
+            <p>
+                This is a key concept from P2079R10. It means that when you submit parallel work, the scheduler
+                guarantees that all tasks will eventually make progress. This prevents deadlocks from nested
+                parallelism:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Nested parallelism - outer parallel work calls inner parallel work</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>get_parallel_scheduler();
+
+stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">100</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">       </span><span style="color: #888">// Outer parallel work</span>
+<span style="color: #BBB">       </span><span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>inner<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">         </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">50</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>j)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #888">/* inner work */</span><span style="color: #BBB"> </span>});
+<span style="color: #BBB">       </span>stdexec<span style="color: #333">::</span>sync_wait(std<span style="color: #333">::</span>move(inner));
+<span style="color: #BBB">     </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>sync_wait();
+
+<span style="color: #888">// With parallel forward progress: No deadlock!</span>
+<span style="color: #888">// The scheduler ensures inner work can make progress</span>
+<span style="color: #888">// even when outer work is using all threads</span>
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">How It Fits with Senders/Receivers</h3>
+            <p>
+                The parallel scheduler integrates seamlessly with the P2300 sender/receiver model. It's just
+                another scheduler, but with special properties that make it suitable for parallel algorithms:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Parallel scheduler is a regular scheduler</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>par_sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// Works with all sender algorithms</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>work<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>schedule(par_sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>then([]()<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">return</span><span style="color: #BBB"> </span>load_data();<span style="color: #BBB"> </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">1000</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i,<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>data)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span>process(i,<span style="color: #BBB"> </span>data);<span style="color: #BBB"> </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>then([](<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>data)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">return</span><span style="color: #BBB"> </span>finalize(data);<span style="color: #BBB"> </span>});
+
+stdexec<span style="color: #333">::</span>sync_wait(std<span style="color: #333">::</span>move(work));
+</pre>
+            </div>
+
+            <!-- TECHNICAL SPECIFICATION SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="technical-specification" style="color: #222; font-weight: bold;">Our Implementation Using HPX</h2>
+
+            <h3 style="color: #555; font-weight: normal;">Why HPX?</h3>
+            <p>
+                HPX (High Performance ParalleX) is a C++ runtime system with a sophisticated work-stealing
+                scheduler. It's a perfect fit for implementing the parallel scheduler concept because:
+            </p>
+            <ul>
+                <li><strong>Work-stealing scheduler:</strong> Automatically balances load across threads</li>
+                <li><strong>Lightweight threads:</strong> Can handle millions of tasks efficiently</li>
+                <li><strong>Asynchronous execution:</strong> Built on futures and continuations</li>
+                <li><strong>Parallel forward progress:</strong> Already handles nested parallelism correctly</li>
+                <li><strong>Production-ready:</strong> Used in scientific computing and HPC applications</li>
+            </ul>
+
+            <h3 style="color: #555; font-weight: normal;">Core Architecture</h3>
+
+            <p>Our implementation has three main components:</p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// 1. parallel_scheduler - The main scheduler interface</span>
+<span style="color: #080; font-weight: bold">class</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">parallel_scheduler</span><span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>std<span style="color: #333">::</span>shared_ptr<span style="color: #333">&lt;</span>parallel_scheduler_backend<span style="color: #333">&gt;</span><span style="color: #BBB"> </span>backend_;
+<span style="color: #080; font-weight: bold">public</span><span style="color: #333">:</span>
+<span style="color: #BBB">  </span><span style="color: #888">// Standard scheduler interface</span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>schedule()<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">const</span><span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">noexcept</span>;
+};
+
+<span style="color: #888">// 2. parallel_scheduler_backend - Abstract backend interface</span>
+<span style="color: #080; font-weight: bold">class</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">parallel_scheduler_backend</span><span style="color: #BBB"> </span>{
+<span style="color: #080; font-weight: bold">public</span><span style="color: #333">:</span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #333">~</span>parallel_scheduler_backend()<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">default</span>;
+<span style="color: #BBB">  </span>
+<span style="color: #BBB">  </span><span style="color: #888">// Core operations</span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">void</span><span style="color: #BBB"> </span>schedule(<span style="color: #888">/*...*/</span>)<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">void</span><span style="color: #BBB"> </span>schedule_bulk_chunked(<span style="color: #888">/*...*/</span>)<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">void</span><span style="color: #BBB"> </span>schedule_bulk_unchunked(<span style="color: #888">/*...*/</span>)<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;
+};
+
+<span style="color: #888">// 3. hpx_parallel_scheduler_backend - HPX implementation</span>
+<span style="color: #080; font-weight: bold">class</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">hpx_parallel_scheduler_backend</span><span style="color: #BBB"> </span><span style="color: #333">:</span><span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">public</span><span style="color: #BBB"> </span>parallel_scheduler_backend<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>thread_pool_policy_scheduler<span style="color: #BBB"> </span>underlying_;<span style="color: #BBB"> </span><span style="color: #888">// HPX work-stealing scheduler</span>
+};
+</pre>
+            </div>
+
+            <p>This layered design provides <strong>replaceability</strong> - applications can provide custom backends
+                while maintaining the same interface.</p>
+
+            <h3 style="color: #555; font-weight: normal;">How HPX Maps to the Parallel Scheduler Model</h3>
+
+            <p>HPX's features naturally align with P2079R10 requirements:</p>
+
+            <div style="text-align: center; margin: 2em 0;">
+                <table
+                    style="margin: 0 auto; border-collapse: collapse; border: 2px solid #333; background: #f9f9f9; max-width: 700px;">
+                    <tr style="background: #e0e0e0;">
+                        <th style="border: 1px solid #333; padding: 12px; font-weight: bold;">P2079R10 Requirement</th>
+                        <th style="border: 1px solid #333; padding: 12px; font-weight: bold;">HPX Feature</th>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px;">Shared execution context</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Global thread pool with work-stealing</td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px;">Parallel forward progress</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Lightweight threads + task suspension</td>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px;">Efficient bulk operations</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Optimized chunking strategies</td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px;">Scalability</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Proven to scale to thousands of cores</td>
+                    </tr>
+                </table>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Key Implementation Details</h3>
+
+            <p><strong>1. Scheduler Abstraction</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Users get the parallel scheduler through a factory function</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// Internally, this creates a scheduler wrapping HPX's thread pool</span>
+<span style="color: #080; font-weight: bold">inline</span><span style="color: #BBB"> </span>parallel_scheduler<span style="color: #BBB"> </span><span style="color: #06B; font-weight: bold">get_parallel_scheduler</span>()<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">static</span><span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>backend<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>query_parallel_scheduler_backend();
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">return</span><span style="color: #BBB"> </span>parallel_scheduler{backend};
+}
+</pre>
+            </div>
+
+            <p><strong>2. Task Submission</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// When you schedule work, it goes through the backend</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sender<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>sched.schedule();<span style="color: #BBB"> </span><span style="color: #888">// Returns a sender</span>
+
+<span style="color: #888">// For bulk operations, we use optimized HPX bulk execution</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>bulk_work<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>sender<span style="color: #BBB"> </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">10000</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span><span style="color: #888">// This work runs on HPX's thread pool</span>
+<span style="color: #BBB">  </span><span style="color: #888">// with work-stealing and chunking optimizations</span>
+});
+</pre>
+            </div>
+
+            <p><strong>3. Domain Customization for Performance</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// The parallel_scheduler has a custom domain</span>
+<span style="color: #888">// that intercepts bulk operations and optimizes them</span>
+<span style="color: #080; font-weight: bold">struct</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">parallel_scheduler_domain</span><span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">template</span><span style="color: #333">&lt;</span>bulk_sender<span style="color: #BBB"> </span>Sender<span style="color: #333">&gt;</span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>transform_sender(Sender<span style="color: #333">&amp;&amp;</span><span style="color: #BBB"> </span>snd)<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">const</span><span style="color: #BBB"> </span>{
+<span style="color: #BBB">    </span><span style="color: #888">// Transform to HPX's optimized bulk sender</span>
+<span style="color: #BBB">    </span><span style="color: #888">// Uses work-stealing, chunking, NUMA awareness</span>
+<span style="color: #BBB">    </span><span style="color: #080; font-weight: bold">return</span><span style="color: #BBB"> </span>hpx_optimized_bulk_sender{<span style="color: #888">/*...*/</span>};
+<span style="color: #BBB">  </span>}
+};
+</pre>
+            </div>
+
+            <!-- IMPLEMENTATION GUIDANCE SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="implementation-guidance" style="color: #222; font-weight: bold;">Before vs After: Key Changes</h2>
+
+            <p>
+                Let's compare how parallel execution works before and after implementing the parallel scheduler:
+            </p>
+
+            <div style="text-align: center; margin: 2em 0;">
+                <table
+                    style="margin: 0 auto; border-collapse: collapse; border: 2px solid #333; background: #f9f9f9; max-width: 900px;">
+                    <tr style="background: #e0e0e0;">
+                        <th style="border: 1px solid #333; padding: 12px; font-weight: bold;">Aspect</th>
+                        <th style="border: 1px solid #333; padding: 12px; font-weight: bold;">Before (Manual Threads)
+                        </th>
+                        <th style="border: 1px solid #333; padding: 12px; font-weight: bold;">After (Parallel Scheduler)
+                        </th>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px; font-weight: bold;">Resource Usage</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Each library creates own thread pool →
+                            oversubscription</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Shared thread pool → optimal resource usage
+                        </td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px; font-weight: bold;">Composability</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Poor - different systems don't work together
+                        </td>
+                        <td style="border: 1px solid #333; padding: 12px;">Excellent - all use same execution context
+                        </td>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px; font-weight: bold;">Nested Parallelism</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Deadlock prone, thread pool exhaustion</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Handled correctly with forward progress
+                            guarantee</td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px; font-weight: bold;">Abstraction Level</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Low - manual thread management</td>
+                        <td style="border: 1px solid #333; padding: 12px;">High - declarative sender/receiver model</td>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px; font-weight: bold;">Scalability</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Limited by fixed thread counts</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Scales to thousands of cores with
+                            work-stealing</td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px; font-weight: bold;">Performance</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Inconsistent, depends on manual tuning</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Optimized automatically with chunking &
+                            work-stealing</td>
+                    </tr>
+                </table>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Detailed Comparison: Resource Usage</h3>
+
+            <p><strong>Before (Manual Thread Management):</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Library A creates its own thread pool</span>
+std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span>std<span style="color: #333">::</span><span style="color: #080; font-weight: bold">thread</span><span style="color: #333">&gt;</span><span style="color: #BBB"> </span>library_a_threads(<span style="color: #00D; font-weight: bold">4</span>);
+
+<span style="color: #888">// Library B creates its own thread pool</span>
+std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span>std<span style="color: #333">::</span><span style="color: #080; font-weight: bold">thread</span><span style="color: #333">&gt;</span><span style="color: #BBB"> </span>library_b_threads(<span style="color: #00D; font-weight: bold">4</span>);
+
+<span style="color: #888">// Your application creates threads too</span>
+std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span>std<span style="color: #333">::</span><span style="color: #080; font-weight: bold">thread</span><span style="color: #333">&gt;</span><span style="color: #BBB"> </span>app_threads(<span style="color: #00D; font-weight: bold">4</span>);
+
+<span style="color: #888">// Result: 12 threads competing for 4 cores!</span>
+<span style="color: #888">// Massive context switching overhead</span>
+</pre>
+            </div>
+
+            <p><strong>After (Parallel Scheduler):</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Everyone uses the same parallel scheduler</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// Library A uses it</span>
+stdexec<span style="color: #333">::</span>schedule(sched)<span style="color: #BBB"> </span><span style="color: #333">|</span><span style="color: #BBB"> </span>library_a_work();
+
+<span style="color: #888">// Library B uses it</span>
+stdexec<span style="color: #333">::</span>schedule(sched)<span style="color: #BBB"> </span><span style="color: #333">|</span><span style="color: #BBB"> </span>library_b_work();
+
+<span style="color: #888">// Your application uses it</span>
+stdexec<span style="color: #333">::</span>schedule(sched)<span style="color: #BBB"> </span><span style="color: #333">|</span><span style="color: #BBB"> </span>app_work();
+
+<span style="color: #888">// Result: Shared thread pool with optimal thread count</span>
+<span style="color: #888">// Work-stealing ensures efficient load balancing</span>
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Detailed Comparison: Nested Parallelism</h3>
+
+            <p><strong>Before (Deadlock Risk):</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #080; font-weight: bold">static_thread_pool</span><span style="color: #BBB"> </span>pool(<span style="color: #00D; font-weight: bold">4</span>);<span style="color: #BBB"> </span><span style="color: #888">// Only 4 threads</span>
+
+<span style="color: #888">// Outer parallel work uses all 4 threads</span>
+<span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;<span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">&lt;</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">4</span>;<span style="color: #BBB"> </span><span style="color: #333">++</span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>pool.execute([<span style="color: #333">&amp;</span>]()<span style="color: #BBB"> </span>{
+<span style="color: #BBB">    </span><span style="color: #888">// Inner parallel work needs threads too</span>
+<span style="color: #BBB">    </span><span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>j<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;<span style="color: #BBB"> </span>j<span style="color: #BBB"> </span><span style="color: #333">&lt;</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">4</span>;<span style="color: #BBB"> </span><span style="color: #333">++</span>j)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">      </span>pool.execute([<span style="color: #333">&amp;</span>]()<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span>inner_work();<span style="color: #BBB"> </span>});
+<span style="color: #BBB">    </span>}
+<span style="color: #BBB">    </span>wait_for_inner_work();<span style="color: #BBB"> </span><span style="color: #888">// DEADLOCK! No threads available</span>
+<span style="color: #BBB">  </span>});
+}
+</pre>
+            </div>
+
+            <p><strong>After (Parallel Forward Progress):</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// Outer parallel work</span>
+stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">4</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">       </span><span style="color: #888">// Inner parallel work</span>
+<span style="color: #BBB">       </span><span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>inner<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">         </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">4</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>j)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span>inner_work();<span style="color: #BBB"> </span>});
+<span style="color: #BBB">       </span>stdexec<span style="color: #333">::</span>sync_wait(std<span style="color: #333">::</span>move(inner));
+<span style="color: #BBB">       </span><span style="color: #888">// No deadlock! HPX suspends outer task and runs inner work</span>
+<span style="color: #BBB">     </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>sync_wait();
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Abstraction Level Improvement</h3>
+
+            <p>
+                The parallel scheduler raises the abstraction level significantly. Instead of managing threads
+                manually, you work with high-level sender/receiver operations:
+            </p>
+
+            <p><strong>Before (Low-Level):</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Manual thread management, synchronization, error handling</span>
+std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span>std<span style="color: #333">::</span><span style="color: #080; font-weight: bold">thread</span><span style="color: #333">&gt;</span><span style="color: #BBB"> </span>threads;
+std<span style="color: #333">::</span>mutex<span style="color: #BBB"> </span>mtx;
+std<span style="color: #333">::</span>exception_ptr<span style="color: #BBB"> </span>error;
+
+<span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;<span style="color: #BBB"> </span>i<span style="color: #BBB"> </span><span style="color: #333">&lt;</span><span style="color: #BBB"> </span>num_threads;<span style="color: #BBB"> </span><span style="color: #333">++</span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>threads.emplace_back([<span style="color: #333">&amp;</span>,<span style="color: #BBB"> </span>i]()<span style="color: #BBB"> </span>{
+<span style="color: #BBB">    </span><span style="color: #080; font-weight: bold">try</span><span style="color: #BBB"> </span>{
+<span style="color: #BBB">      </span>process_chunk(i);
+<span style="color: #BBB">    </span>}<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">catch</span><span style="color: #BBB"> </span>(...)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">      </span>std<span style="color: #333">::</span>lock_guard<span style="color: #BBB"> </span>lock(mtx);
+<span style="color: #BBB">      </span>error<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>std<span style="color: #333">::</span>current_exception();
+<span style="color: #BBB">    </span>}
+<span style="color: #BBB">  </span>});
+}
+
+<span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #080; font-weight: bold">auto</span><span style="color: #333">&amp;</span><span style="color: #BBB"> </span>t<span style="color: #BBB"> </span><span style="color: #333">:</span><span style="color: #BBB"> </span>threads)<span style="color: #BBB"> </span>t.join();
+<span style="color: #080; font-weight: bold">if</span><span style="color: #BBB"> </span>(error)<span style="color: #BBB"> </span>std<span style="color: #333">::</span>rethrow_exception(error);
+</pre>
+            </div>
+
+            <p><strong>After (High-Level):</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Declarative, composable, automatic error propagation</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>get_parallel_scheduler();
+
+stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(num_tasks,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span>process_chunk(i);<span style="color: #BBB"> </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>sync_wait();
+
+<span style="color: #888">// Errors automatically propagated, resources automatically managed</span>
+</pre>
+            </div>
+
+            <!-- REAL-WORLD EXAMPLES SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="real-world-examples" style="color: #222; font-weight: bold;">How It Works in Practice</h2>
+
+            <h3 style="color: #555; font-weight: normal;">Basic Usage Workflow</h3>
+
+            <p><strong>Step 1: Get the Parallel Scheduler</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Get the system's parallel scheduler</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// This returns a shared scheduler backed by HPX's thread pool</span>
+<span style="color: #888">// All calls to get_parallel_scheduler() return the same logical scheduler</span>
+</pre>
+            </div>
+
+            <p><strong>Step 2: Submit Parallel Work</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Create a sender that schedules work on the parallel scheduler</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>work<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">10000</span>,<span style="color: #BBB"> </span>[](<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">       </span><span style="color: #888">// Process element i</span>
+<span style="color: #BBB">       </span>process_element(i);
+<span style="color: #BBB">     </span>});
+
+<span style="color: #888">// The work is described but not yet executed</span>
+</pre>
+            </div>
+
+            <p><strong>Step 3: Execute and Synchronize</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Execute the work and wait for completion</span>
+stdexec<span style="color: #333">::</span>sync_wait(std<span style="color: #333">::</span>move(work));
+
+<span style="color: #888">// Or chain more operations before executing</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>result<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(<span style="color: #00D; font-weight: bold">1000</span>,<span style="color: #BBB"> </span>process_fn)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>then([]()<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">return</span><span style="color: #BBB"> </span>finalize();<span style="color: #BBB"> </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>sync_wait();
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Real-World Usage Scenarios</h3>
+
+            <p><strong>Scenario 1: CPU-Bound Data Processing</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Process a large dataset in parallel</span>
+std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span><span style="color: #339; font-weight: bold">double</span><span style="color: #333">&gt;</span><span style="color: #BBB"> </span>data(<span style="color: #00D; font-weight: bold">1000000</span>);
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+
+stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(data.size(),<span style="color: #BBB"> </span>[<span style="color: #333">&amp;</span>data](<span style="color: #339; font-weight: bold">size_t</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">       </span><span style="color: #888">// Complex computation on each element</span>
+<span style="color: #BBB">       </span>data[i]<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>std<span style="color: #333">::</span>sqrt(data[i]<span style="color: #BBB"> </span><span style="color: #333">*</span><span style="color: #BBB"> </span>data[i]<span style="color: #BBB"> </span><span style="color: #333">+</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">1.0</span>);
+<span style="color: #BBB">     </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>sync_wait();
+
+<span style="color: #888">// HPX automatically chunks the work and distributes it efficiently</span>
+</pre>
+            </div>
+
+            <p><strong>Scenario 2: Parallel Algorithms</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Use parallel scheduler with standard algorithms</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// Parallel transform</span>
+stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(input.size(),<span style="color: #BBB"> </span>[<span style="color: #333">&amp;</span>](<span style="color: #339; font-weight: bold">size_t</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">       </span>output[i]<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>transform_fn(input[i]);
+<span style="color: #BBB">     </span>})
+<span style="color: #BBB">  </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>sync_wait();
+</pre>
+            </div>
+
+            <p><strong>Scenario 3: Large-Scale Scientific Computing</strong></p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Simulate particles in parallel</span>
+<span style="color: #080; font-weight: bold">struct</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">Particle</span><span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #888">/* ... */</span><span style="color: #BBB"> </span>};
+std<span style="color: #333">::</span>vector<span style="color: #333">&lt;</span>Particle<span style="color: #333">&gt;</span><span style="color: #BBB"> </span>particles(<span style="color: #00D; font-weight: bold">1000000</span>);
+
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+
+<span style="color: #888">// Run simulation steps</span>
+<span style="color: #080; font-weight: bold">for</span><span style="color: #BBB"> </span>(<span style="color: #339; font-weight: bold">int</span><span style="color: #BBB"> </span>step<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;<span style="color: #BBB"> </span>step<span style="color: #BBB"> </span><span style="color: #333">&lt;</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">1000</span>;<span style="color: #BBB"> </span><span style="color: #333">++</span>step)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>stdexec<span style="color: #333">::</span>schedule(sched)
+<span style="color: #BBB">    </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>bulk(particles.size(),<span style="color: #BBB"> </span>[<span style="color: #333">&amp;</span>](<span style="color: #339; font-weight: bold">size_t</span><span style="color: #BBB"> </span>i)<span style="color: #BBB"> </span>{
+<span style="color: #BBB">         </span>particles[i].update_position();
+<span style="color: #BBB">         </span>particles[i].update_velocity();
+<span style="color: #BBB">       </span>})
+<span style="color: #BBB">    </span><span style="color: #333">|</span><span style="color: #BBB"> </span>stdexec<span style="color: #333">::</span>sync_wait();
+}
+
+<span style="color: #888">// Scales efficiently to thousands of cores</span>
+</pre>
+            </div>
+
+            <!-- UNDER THE HOOD SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="under-the-hood" style="color: #222; font-weight: bold;">Under the Hood: How Scheduling is
+                Implemented</h2>
+
+            <p>
+                HPX's <code>parallel_scheduler</code> is a <strong>thin domain-aware wrapper</strong> around the
+                existing
+                <code>thread_pool_policy_scheduler&lt;hpx::launch&gt;</code>. Rather than building an entirely new
+                execution backend, it reuses HPX's mature thread pool infrastructure and plugs
+                into <code>stdexec</code>'s domain-based sender transformation pipeline.
+            </p>
+
+            <h3 style="color: #555; font-weight: normal;">Class Hierarchy & Object Model</h3>
+            <p>Here is a breakdown of how the different components relate to each other:</p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// The parallel_scheduler wrapper</span>
+parallel_scheduler
+  <span style="color: #333">&#x2514;&#x2500;&#x2500;</span> shared_ptr&lt;parallel_scheduler_backend&gt;   (type-erased, heap-allocated)
+
+<span style="color: #888">// The abstract backend interface</span>
+parallel_scheduler_backend (abstract)
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> schedule(receiver_proxy&amp;)
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> schedule_bulk_chunked(n, bulk_proxy&amp;)
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> schedule_bulk_unchunked(n, bulk_proxy&amp;)
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> equal_to(other&amp;) &#x2192; bool
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> get_underlying_scheduler() &#x2192; const thread_pool_policy_scheduler*
+  <span style="color: #333">&#x2514;&#x2500;&#x2500;</span> get_pu_mask() &#x2192; const mask_type*
+
+<span style="color: #888">// The concrete default implementation</span>
+hpx_parallel_scheduler_backend (concrete default)
+  <span style="color: #333">&#x2514;&#x2500;&#x2500;</span> wraps thread_pool_policy_scheduler + mask_type
+
+<span style="color: #888">// The factory function</span>
+get_parallel_scheduler()
+  <span style="color: #333">&#x2514;&#x2500;&#x2500;</span> queries query_parallel_scheduler_backend()
+  <span style="color: #333">&#x2514;&#x2500;&#x2500;</span> wraps the returned shared_ptr in a parallel_scheduler
+
+<span style="color: #888">// Operation state for connecting senders and receivers</span>
+operation_state&lt;Receiver&gt;
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> receiver_
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> backend_  (shared_ptr to backend)
+  <span style="color: #333">&#x251C;&#x2500;&#x2500;</span> proxy_    (concrete_receiver_proxy, member &#x2014; not local)
+  <span style="color: #333">&#x2514;&#x2500;&#x2500;</span> start() &#x2192; backend_-&gt;schedule(proxy_)
+
+<span style="color: #888">// Scheduler equality comparison</span>
+operator== &#x2192; backend_-&gt;equal_to(*other.backend_)
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Execution Flow: How Polices Are Handled</h3>
+            <p>
+                When you use the parallel scheduler, here is the exact flow of how policies (like bulk dispatching) are
+                implemented under the hood:
+            </p>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span>get_parallel_scheduler()
+    |
+    v
+parallel_scheduler  (owns thread_pool_policy_scheduler + cached PU mask)
+    |
+    |-- schedule() --&gt; sender&lt;parallel_scheduler&gt;
+    |                    |-- env exposes: get_completion_scheduler&lt;set_value_t&gt;
+    |                    |                get_domain --&gt; parallel_scheduler_domain
+    |                    |-- connect() --&gt; operation_state
+    |                                        |-- start() --&gt; checks stop_token
+    |                                                        delegates to thread_pool.execute()
+    |
+    |-- bulk / bulk_chunked / bulk_unchunked
+         |-- parallel_scheduler_domain::transform_sender()
+              |-- extracts underlying thread_pool_policy_scheduler
+              |-- creates thread_pool_bulk_sender&lt;..., IsChunked, IsParallel&gt;
+                   |-- uses work-stealing index queues
+                   |-- NUMA-aware thread placement
+                   |-- main-thread participation
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">Sequential vs Parallel Execution Policies (seq / par)</h3>
+            <p>
+                A crucial part of scheduling tasks effectively is deciding whether the execution should happen
+                sequentially (<code>hpx::execution::seq</code>) or in parallel (<code>hpx::execution::par</code>).
+                Within the <code>parallel_scheduler</code> infrastructure, this policy directly controls the underlying
+                bulk sender characteristics:
+            </p>
+            <ul>
+                <li><strong>Parallel Policy (<code>par</code>):</strong> When scheduled concurrently (mapping to
+                    <code>IsParallel = true</code> in the backend), work is heavily distributed across the work-stealing
+                    queues of the HPX thread pool. Chunks of iterations are dispatched asynchronously to different
+                    worker threads, maximizing the utilization of CPU cores and fully leveraging NUMA-aware task
+                    placement.</li>
+                <li><strong>Sequential Policy (<code>seq</code>):</strong> When scheduled sequentially
+                    (<code>IsParallel = false</code>), the bulk operation executes inline. All iterations run
+                    synchronously on the calling thread's context without spawning auxiliary HPX tasks or incurring the
+                    synchronization overhead of parallel dispatch, making it incredibly fast for tiny workloads.</li>
+            </ul>
+
+            <!-- PERFORMANCE CONSIDERATIONS SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="performance-considerations" style="color: #222; font-weight: bold;">Why This Matters</h2>
+
+            <h3 style="color: #555; font-weight: normal;">Performance Benefits</h3>
+
+            <p><strong>1. Eliminates Oversubscription</strong></p>
+            <p>
+                By sharing a single thread pool across all libraries and components, the parallel scheduler
+                prevents the performance degradation caused by too many threads competing for CPU cores:
+            </p>
+            <ul>
+                <li>Reduced context switching overhead</li>
+                <li>Better CPU cache utilization</li>
+                <li>Optimal thread count matching hardware capabilities</li>
+                <li>Lower memory footprint (fewer thread stacks)</li>
+            </ul>
+
+            <p><strong>2. Work-Stealing Efficiency</strong></p>
+            <p>
+                HPX's work-stealing scheduler automatically balances load across threads. When one thread
+                finishes its work, it steals tasks from busy threads:
+            </p>
+            <ul>
+                <li>Automatic load balancing without manual tuning</li>
+                <li>Scales efficiently from 1 to thousands of cores</li>
+                <li>Handles irregular workloads gracefully</li>
+                <li>Minimizes idle time</li>
+            </ul>
+
+            <p><strong>3. Optimized Bulk Operations</strong></p>
+            <p>
+                The parallel scheduler uses intelligent chunking strategies to minimize overhead:
+            </p>
+            <ul>
+                <li>Larger chunks reduce task creation overhead</li>
+                <li>Smaller chunks improve load balancing</li>
+                <li>Adaptive chunk sizes based on workload</li>
+                <li>Cache-friendly data access patterns</li>
+            </ul>
+
+            <h3 style="color: #555; font-weight: normal;">Maintainability Benefits</h3>
+
+            <p><strong>Simpler Code</strong></p>
+            <p>
+                The high-level sender/receiver model eliminates boilerplate:
+            </p>
+            <ul>
+                <li>No manual thread management</li>
+                <li>No explicit synchronization primitives</li>
+                <li>Automatic error propagation</li>
+                <li>Composable operations</li>
+            </ul>
+
+            <p><strong>Better Composability</strong></p>
+            <p>
+                Different libraries can work together seamlessly:
+            </p>
+            <ul>
+                <li>Shared execution context prevents conflicts</li>
+                <li>Standard sender/receiver interface</li>
+                <li>Easy to integrate third-party parallel algorithms</li>
+                <li>Nested parallelism works correctly</li>
+            </ul>
+
+            <h3 style="color: #555; font-weight: normal;">Portability Benefits</h3>
+
+            <p><strong>Platform Independence</strong></p>
+            <p>
+                The parallel scheduler abstraction works across different platforms:
+            </p>
+            <ul>
+                <li>Same code runs on Linux, Windows, macOS</li>
+                <li>Can integrate with OS thread pools (Windows thread pool, GCD)</li>
+                <li>Adapts to different hardware (CPUs, accelerators)</li>
+                <li>Portable performance characteristics</li>
+            </ul>
+
+            <h3 style="color: #555; font-weight: normal;">Alignment with Future C++ Concurrency</h3>
+
+            <p>
+                The parallel scheduler is part of the evolution toward structured concurrency in C++:
+            </p>
+            <ul>
+                <li><strong>P2300 (Senders/Receivers):</strong> Foundation for async operations</li>
+                <li><strong>P2079R10 (Parallel Scheduler):</strong> Standard parallel execution context</li>
+                <li><strong>Future proposals:</strong> Parallel algorithms using senders</li>
+                <li><strong>Industry adoption:</strong> Major C++ projects moving to this model</li>
+            </ul>
+
+            <p>
+                By implementing the parallel scheduler now, HPX users are ready for the future of C++ concurrency.
+            </p>
+
+            <!-- DESIGN RATIONALE SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="design-rationale" style="color: #222; font-weight: bold;">Design Decisions and Replaceability</h2>
+
+            <h3 style="color: #555; font-weight: normal;">Why Replaceability Matters</h3>
+
+            <p>
+                P2079R10 emphasizes that the parallel scheduler should be <strong>replaceable</strong>. This means
+                applications can provide their own implementation while maintaining the same interface:
+            </p>
+
+            <ul>
+                <li><strong>Custom backends:</strong> Use different thread pools or execution models</li>
+                <li><strong>Platform integration:</strong> Integrate with OS-specific thread pools</li>
+                <li><strong>Testing:</strong> Use mock schedulers for unit tests</li>
+                <li><strong>Profiling:</strong> Add instrumentation without changing application code</li>
+            </ul>
+
+            <h3 style="color: #555; font-weight: normal;">Our Replaceability Architecture</h3>
+
+            <p>We implemented replaceability through a backend abstraction layer:</p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// Abstract backend interface</span>
+<span style="color: #080; font-weight: bold">class</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">parallel_scheduler_backend</span><span style="color: #BBB"> </span>{
+<span style="color: #080; font-weight: bold">public</span><span style="color: #333">:</span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #333">~</span>parallel_scheduler_backend()<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">default</span>;
+<span style="color: #BBB">  </span>
+<span style="color: #BBB">  </span><span style="color: #888">// Core scheduling operations</span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">void</span><span style="color: #BBB"> </span>schedule(<span style="color: #888">/*...*/</span>)<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">void</span><span style="color: #BBB"> </span>schedule_bulk_chunked(<span style="color: #888">/*...*/</span>)<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">void</span><span style="color: #BBB"> </span>schedule_bulk_unchunked(<span style="color: #888">/*...*/</span>)<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;
+<span style="color: #BBB">  </span>
+<span style="color: #BBB">  </span><span style="color: #888">// Equality and introspection</span>
+<span style="color: #BBB">  </span><span style="color: #080; font-weight: bold">virtual</span><span style="color: #BBB"> </span><span style="color: #339; font-weight: bold">bool</span><span style="color: #BBB"> </span>equal_to(<span style="color: #080; font-weight: bold">const</span><span style="color: #BBB"> </span>parallel_scheduler_backend<span style="color: #333">*</span>)<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">const</span><span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span><span style="color: #00D; font-weight: bold">0</span>;
+};
+
+<span style="color: #888">// Default HPX implementation</span>
+<span style="color: #080; font-weight: bold">class</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">hpx_parallel_scheduler_backend</span><span style="color: #BBB"> </span><span style="color: #333">:</span><span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">public</span><span style="color: #BBB"> </span>parallel_scheduler_backend<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span>thread_pool_policy_scheduler<span style="color: #BBB"> </span>underlying_;
+<span style="color: #080; font-weight: bold">public</span><span style="color: #333">:</span>
+<span style="color: #BBB">  </span><span style="color: #888">// Implements all virtual methods using HPX's thread pool</span>
+};
+</pre>
+            </div>
+
+            <h3 style="color: #555; font-weight: normal;">How to Provide a Custom Backend</h3>
+
+            <p>Applications can replace the default backend:</p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span></span><span style="color: #888">// 1. Implement your custom backend</span>
+<span style="color: #080; font-weight: bold">class</span><span style="color: #BBB"> </span><span style="color: #B06; font-weight: bold">my_custom_backend</span><span style="color: #BBB"> </span><span style="color: #333">:</span><span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">public</span><span style="color: #BBB"> </span>parallel_scheduler_backend<span style="color: #BBB"> </span>{
+<span style="color: #BBB">  </span><span style="color: #888">// Implement all virtual methods</span>
+<span style="color: #BBB">  </span><span style="color: #888">// Could use a different thread pool, GPU executor, etc.</span>
+};
+
+<span style="color: #888">// 2. Set your backend as the factory</span>
+hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>set_parallel_scheduler_backend_factory(
+<span style="color: #BBB">  </span>[]()<span style="color: #BBB"> </span>{<span style="color: #BBB"> </span><span style="color: #080; font-weight: bold">return</span><span style="color: #BBB"> </span>std<span style="color: #333">::</span>make_shared<span style="color: #333">&lt;</span>my_custom_backend<span style="color: #333">&gt;</span>();<span style="color: #BBB"> </span>}
+);
+
+<span style="color: #888">// 3. Now all calls to get_parallel_scheduler() use your backend</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #BBB"> </span>sched<span style="color: #BBB"> </span><span style="color: #333">=</span><span style="color: #BBB"> </span>hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+<span style="color: #888">// Uses my_custom_backend internally!</span>
+</pre>
+            </div>
+
+
+            <h3 style="color: #555; font-weight: normal;">Benefits of This Design</h3>
+
+            <p><strong>1. Flexibility</strong></p>
+            <ul>
+                <li>Applications can choose the best backend for their needs</li>
+                <li>Easy to experiment with different execution strategies</li>
+                <li>No need to recompile application code when changing backends</li>
+            </ul>
+
+            <p><strong>2. Testability</strong></p>
+            <ul>
+                <li>Mock backends for unit testing</li>
+                <li>Deterministic execution for debugging</li>
+                <li>Performance profiling without code changes</li>
+            </ul>
+
+            <p><strong>3. Platform Integration</strong></p>
+            <ul>
+                <li>Can wrap OS-specific thread pools (Windows, macOS, Linux)</li>
+                <li>Integration with GPU executors</li>
+                <li>Custom scheduling policies for specific domains</li>
+            </ul>
+
+            <h3 style="color: #555; font-weight: normal;">Key Design Decisions</h3>
+
+            <p><strong>Shared Pointer for Backend</strong></p>
+            <p>
+                The parallel scheduler stores a <code>shared_ptr&lt;parallel_scheduler_backend&gt;</code>. This allows:
+            </p>
+            <ul>
+                <li>Multiple scheduler instances to share the same backend</li>
+                <li>Efficient copying of schedulers</li>
+                <li>Proper lifetime management</li>
+            </ul>
+
+            <p><strong>Virtual Interface for Operations</strong></p>
+            <p>
+                Using virtual methods allows runtime polymorphism:
+            </p>
+            <ul>
+                <li>Different backends can have completely different implementations</li>
+                <li>No template bloat from multiple backend types</li>
+                <li>Clean separation between interface and implementation</li>
+            </ul>
+
+            <p><strong>Domain Customization for Performance</strong></p>
+            <p>
+                The parallel scheduler has a custom domain that optimizes bulk operations:
+            </p>
+            <ul>
+                <li>Intercepts stdexec bulk operations</li>
+                <li>Transforms them to use HPX's optimized bulk sender</li>
+                <li>Maintains sender/receiver composability</li>
+                <li>Zero-overhead abstraction</li>
+            </ul>
+
+            <!-- BEST PRACTICES SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="best-practices" style="color: #222; font-weight: bold;">Best Practices</h2>
+
+            <h3 style="color: #555; font-weight: normal;">Using the Parallel Scheduler</h3>
+            <p><strong>Do:</strong></p>
+            <ul>
+                <li>Use <code>get_parallel_scheduler()</code> to get the shared scheduler</li>
+                <li>Compose operations using sender/receiver chains</li>
+                <li>Let the scheduler handle resource management automatically</li>
+                <li>Use bulk operations for data-parallel work</li>
+                <li>Trust the work-stealing scheduler for load balancing</li>
+            </ul>
+
+            <p><strong>Don't:</strong></p>
+            <ul>
+                <li>Create your own thread pools when using the parallel scheduler</li>
+                <li>Manually manage thread counts or synchronization</li>
+                <li>Assume specific execution order within bulk operations</li>
+                <li>Block threads waiting for parallel work to complete</li>
+            </ul>
+
+            <h3 style="color: #555; font-weight: normal;">Performance Tips</h3>
+            <p><strong>Do:</strong></p>
+            <ul>
+                <li>Use appropriate chunk sizes for your workload</li>
+                <li>Minimize data sharing between parallel tasks</li>
+                <li>Prefer immutable data or thread-local storage</li>
+                <li>Profile your application to identify bottlenecks</li>
+            </ul>
+
+            <p><strong>Don't:</strong></p>
+            <ul>
+                <li>Create excessive fine-grained tasks (overhead dominates)</li>
+                <li>Use locks or mutexes in hot paths</li>
+                <li>Assume linear speedup without measurement</li>
+            </ul>
+
+            <!-- CONCLUSION SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="conclusion" style="color: #222; font-weight: bold;">Conclusion</h2>
+            <p>
+                The parallel scheduler represents a major step forward in C++ parallel programming. By providing
+                a shared execution context with parallel forward progress guarantees, it solves fundamental
+                problems that have plagued parallel C++ code for years.
+            </p>
+
+            <p><strong>What we've achieved:</strong></p>
+            <ul>
+                <li><strong>Eliminated oversubscription:</strong> Shared thread pool prevents resource conflicts</li>
+                <li><strong>Enabled composability:</strong> Different libraries work together seamlessly</li>
+                <li><strong>Solved nested parallelism:</strong> Forward progress guarantees prevent deadlocks</li>
+                <li><strong>Improved performance:</strong> Work-stealing and optimized chunking deliver scalability</li>
+                <li><strong>Provided replaceability:</strong> Applications can customize the backend</li>
+            </ul>
+
+            <p>
+                Our HPX-based implementation demonstrates that the P2079R10 parallel scheduler concept is
+                practical and delivers real performance benefits. The combination of HPX's proven runtime
+                with the standard sender/receiver model creates a powerful foundation for modern C++ parallel
+                programming.
+            </p>
+
+            <p>
+                As C++ continues to evolve toward structured concurrency, the parallel scheduler will play
+                a central role. By adopting it now, you're preparing your codebase for the future of C++
+                while gaining immediate performance and maintainability benefits.
+            </p>
+
+            <!-- SPECIAL THANKS SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="special-thanks" style="color: #222; font-weight: bold;">Special Thanks</h2>
+            <p>
+                My deepest thanks go to <a href="https://github.com/hkaiser" target="_blank"><strong>Hartmut
+                        Kaiser</strong></a>
+                and <a href="https://github.com/isidorostsa" target="_blank"><strong>Isidoros
+                        Tsaousis-Seiras</strong></a>
+                for their mentorship and invaluable insights throughout this project.
+            </p>
+
+            <!-- REFERENCES SECTION -->
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="references" style="color: #222; font-weight: bold;">References</h2>
+            <ol>
+                <li><strong>[P2079R10]</strong> <a
+                        href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2025/p2079r10.html#r10"
+                        target="_blank">System Execution Context - Parallel Scheduler Proposal</a></li>
+                <li><strong>[P2300R10]</strong> <a
+                        href="https://www.open-std.org/jtc1/sc22/wg21/docs/papers/2024/p2300r10.html"
+                        target="_blank"><code>std::execution</code> - Senders and Receivers</a></li>
+                <li><strong>[HPX]</strong> <a href="https://stellar-group.org/libraries/hpx/" target="_blank">HPX - High
+                        Performance ParalleX Runtime System</a></li>
+                <li><strong>[stdexec]</strong> <a href="https://github.com/NVIDIA/stdexec" target="_blank">NVIDIA
+                        stdexec - Reference Implementation</a></li>
+                <li><strong>[Project #6655]</strong> <a href="https://github.com/STEllAR-GROUP/hpx/pull/6655"
+                        target="_blank">HPX Parallel Scheduler Implementation</a></li>
+            </ol>
+        </section>
+
+        <!-- FOOTER SECTION -->
+        <footer>
+            <p>
+                <small>
+                    Hosted on GitHub Pages &mdash; Theme by
+                    <a href="https://github.com/orderedlist" target="_blank">orderedlist</a><br />
+                    Article template by <a href="https://isuckatcs.github.io/gsoc2022/"
+                        target="_blank">isuckatcs</a><br /><br />
+                </small>
+            </p>
+        </footer>
+    </div>
+
+    <script src="javascripts/scale.fix.js"></script>
+</body>
+
+</html>

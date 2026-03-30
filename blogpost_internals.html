@@ -1,0 +1,894 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="chrome=1" />
+    <title>HPX Parallel Scheduler Internals | Deep Dive into Architecture</title>
+    <link rel="icon" href="./img/stellar_group_little_icon.png" />
+    <link rel="stylesheet" href="stylesheets/styles.css" />
+    <link rel="stylesheet" href="stylesheets/pygment_trac.css" />
+    <meta name="viewport" content="width=device-width" />
+</head>
+
+<body>
+    <div class="wrapper">
+        <header>
+            <a href="https://github.com/charan-003">
+                <img src="./img/stellar_group_icon.svg" width="300px" alt="Sai Charan - C++ Developer" />
+            </a>
+        </header>
+
+        <section>
+            <h1>HPX Parallel Scheduler Internals</h1>
+            <h3><strong>Deep Dive into Architecture and Implementation</strong> @ <strong>2025</strong></h3>
+
+            <p>
+                <span class="nameContainer">
+                    <strong>Sai Charan Arvapally</strong>
+                    <a href="https://www.github.com/charan-003" target="_blank">
+                        <img src="./img/github.svg" width="15px" />
+                    </a>
+                </span>
+                <br />University of Alberta, Canada
+                <br /><a href="blogpost.html">← Back to Main Article</a>
+            </p>
+
+            <h2>Table of Contents</h2>
+            <ul>
+                <li><a href="#architecture-overview">Architecture Overview</a></li>
+                <li><a href="#type-hierarchy">Type Hierarchy and Components</a></li>
+                <li><a href="#execution-policies">Execution Policies</a></li>
+                <li><a href="#task-scheduling">Task Scheduling Flow</a></li>
+                <li><a href="#bulk-operations">Bulk Operations Deep Dive</a></li>
+                <li><a href="#domain-transformation">Domain Transformation Pipeline</a></li>
+                <li><a href="#fast-vs-virtual">Fast Path vs Virtual Path</a></li>
+                <li><a href="#replaceability-api">Replaceability API (P2079R10)</a></li>
+            </ul>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="architecture-overview">Architecture Overview</h2>
+
+            <p>
+                HPX's <code>parallel_scheduler</code> is a <strong>thin domain-aware wrapper</strong> around the
+                existing
+                <code>thread_pool_policy_scheduler&lt;hpx::launch&gt;</code>. Rather than building an entirely new
+                execution backend, it reuses HPX's mature thread pool infrastructure and plugs into stdexec's
+                domain-based sender transformation pipeline.
+            </p>
+
+            <h3>Complete Execution Flow</h3>
+            <pre style="background: #f5f5f5; padding: 1em; border-left: 4px solid #333;">
+get_parallel_scheduler()
+    |
+    v
+parallel_scheduler  (owns shared_ptr&lt;parallel_scheduler_backend&gt;)
+    |
+    |-- schedule() --&gt; sender&lt;parallel_scheduler&gt;
+    |                    |-- env exposes: get_completion_scheduler&lt;set_value_t&gt;
+    |                    |                get_domain -&gt; parallel_scheduler_domain
+    |                    |-- connect(receiver) --&gt; operation_state
+    |                                        |-- start() --&gt; checks stop_token
+    |                                                        delegates to backend-&gt;schedule(proxy)
+    |
+    |-- bulk / bulk_chunked / bulk_unchunked
+         |-- parallel_scheduler_domain::transform_sender()
+              |-- extracts underlying thread_pool_policy_scheduler (fast path)
+              |   OR uses backend virtual dispatch (virtual path)
+              |
+              |-- Fast Path: creates thread_pool_bulk_sender&lt;..., IsChunked, IsParallel, IsUnsequenced&gt;
+              |    |-- uses work-stealing index queues
+              |    |-- NUMA-aware thread placement
+              |    |-- main-thread participation
+              |    |-- adaptive chunking strategies
+              |
+              |-- Virtual Path: creates virtual_parallel_bulk_op
+                   |-- calls backend-&gt;schedule_bulk_chunked() or schedule_bulk_unchunked()
+                   |-- type-erased through base_parallel_bulk_op
+</pre>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="type-hierarchy">Type Hierarchy and Components</h2>
+
+            <h3>Core Type Hierarchy</h3>
+            <pre style="background: #f5f5f5; padding: 1em; border-left: 4px solid #333;">
+parallel_scheduler
+  └── shared_ptr&lt;parallel_scheduler_backend&gt;   (type-erased, heap-allocated)
+
+parallel_scheduler_backend (abstract interface)
+  ├── schedule(std::span&lt;std::byte&gt; storage, receiver_proxy&amp;)
+  ├── schedule_bulk_chunked(std::span&lt;std::byte&gt; storage, n, bulk_proxy&amp;)
+  ├── schedule_bulk_unchunked(std::span&lt;std::byte&gt; storage, n, bulk_proxy&amp;)
+  ├── equal_to(other&amp;) → bool
+  ├── get_underlying_scheduler() → const thread_pool_policy_scheduler*
+  └── get_pu_mask() → const mask_type*
+
+hpx_parallel_scheduler_backend (concrete default implementation)
+  └── wraps thread_pool_policy_scheduler + mask_type
+  └── implements all virtual methods using HPX thread pool
+
+get_parallel_scheduler()
+  └── queries query_parallel_scheduler_backend()
+  └── wraps the returned shared_ptr in a parallel_scheduler
+
+operation_state&lt;Receiver&gt;
+  ├── receiver_                    (user's receiver)
+  ├── backend_                     (shared_ptr to backend)
+  ├── proxy_                       (concrete_receiver_proxy, member — not local)
+  ├── storage_[256]                (pre-allocated buffer for backend use)
+  └── start() → backend_-&gt;schedule(std::span(storage_), proxy_)
+
+operator== → backend_-&gt;equal_to(*other.backend_)
+</pre>
+
+            <h3>Receiver Proxy Hierarchy</h3>
+            <pre style="background: #f5f5f5; padding: 1em; border-left: 4px solid #333;">
+parallel_scheduler_receiver_proxy (abstract)
+  ├── set_value() = 0
+  ├── set_error(exception_ptr) = 0
+  ├── set_stopped() = 0
+  └── stop_requested() → bool = 0
+
+parallel_scheduler_bulk_item_receiver_proxy : parallel_scheduler_receiver_proxy
+  └── execute(begin, end) = 0     (for bulk operations)
+
+concrete_receiver_proxy&lt;Receiver&gt; : parallel_scheduler_receiver_proxy
+  └── implements all methods by forwarding to the actual receiver
+
+concrete_bulk_proxy&lt;F, IsChunked, Values...&gt; : parallel_scheduler_bulk_item_receiver_proxy
+  ├── execute(begin, end):
+  │    if constexpr (IsChunked)
+  │        f_(begin, end, ...values)     // chunked: call once per range
+  │    else
+  │        for i in [begin, end): f_(i, ...values)  // unchunked: call per index
+  └── set_value() → forwards values to receiver
+</pre>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="execution-policies">Execution Policies</h2>
+
+            <p>
+                The parallel scheduler supports <strong>four execution policies</strong> from the C++ standard library,
+                each controlling different aspects of parallel execution:
+            </p>
+
+            <h3>1. Sequential Policy (<code>std::execution::seq</code>)</h3>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;">stdexec<span style="color: #333">::</span>schedule(sched)
+  <span style="color: #333">|</span> stdexec<span style="color: #333">::</span>bulk(stdexec<span style="color: #333">::</span>seq, <span style="color: #00D; font-weight: bold">1000</span>, [](<span style="color: #339; font-weight: bold">int</span> i) { process(i); });
+</pre>
+            </div>
+            <p><strong>Behavior:</strong></p>
+            <ul>
+                <li><code>is_parallel = false</code></li>
+                <li>Executes on a single thread (no parallelism)</li>
+                <li>Guarantees sequential execution order</li>
+                <li>Useful for debugging or when parallelism would cause issues</li>
+            </ul>
+
+            <h3>2. Parallel Policy (<code>std::execution::par</code>)</h3>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;">stdexec<span style="color: #333">::</span>schedule(sched)
+  <span style="color: #333">|</span> stdexec<span style="color: #333">::</span>bulk(stdexec<span style="color: #333">::</span>par, <span style="color: #00D; font-weight: bold">1000</span>, [](<span style="color: #339; font-weight: bold">int</span> i) { process(i); });
+</pre>
+            </div>
+            <p><strong>Behavior:</strong></p>
+            <ul>
+                <li><code>is_parallel = true</code>, <code>is_unsequenced = false</code></li>
+                <li>Executes across multiple threads using work-stealing</li>
+                <li>Default chunk size: 16 (for chunked mode)</li>
+                <li>Allows synchronization primitives (mutexes, atomics)</li>
+                <li>Best for general-purpose parallel work</li>
+            </ul>
+
+            <h3>3. Parallel Unsequenced Policy (<code>std::execution::par_unseq</code>)</h3>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;">stdexec<span style="color: #333">::</span>schedule(sched)
+  <span style="color: #333">|</span> stdexec<span style="color: #333">::</span>bulk(stdexec<span style="color: #333">::</span>par_unseq, <span style="color: #00D; font-weight: bold">1000</span>, [](<span style="color: #339; font-weight: bold">int</span> i) { process(i); });
+</pre>
+            </div>
+            <p><strong>Behavior:</strong></p>
+            <ul>
+                <li><code>is_parallel = true</code>, <code>is_unsequenced = true</code></li>
+                <li>Executes across multiple threads with vectorization hints</li>
+                <li>Smaller chunk size for better load balancing</li>
+                <li><strong>No synchronization allowed</strong> (no mutexes, no atomics)</li>
+                <li>Compiler may vectorize individual iterations</li>
+                <li>Best for data-parallel operations without dependencies</li>
+            </ul>
+
+            <h3>4. Unsequenced Policy (<code>std::execution::unseq</code>)</h3>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;">stdexec<span style="color: #333">::</span>schedule(sched)
+  <span style="color: #333">|</span> stdexec<span style="color: #333">::</span>bulk(stdexec<span style="color: #333">::</span>unseq, <span style="color: #00D; font-weight: bold">1000</span>, [](<span style="color: #339; font-weight: bold">int</span> i) { process(i); });
+</pre>
+            </div>
+            <p><strong>Behavior:</strong></p>
+            <ul>
+                <li><code>is_parallel = false</code>, <code>is_unsequenced = true</code></li>
+                <li>Executes on a single thread but allows vectorization</li>
+                <li>No synchronization allowed</li>
+                <li>Compiler may vectorize and reorder iterations</li>
+                <li>Best for SIMD-friendly operations on a single core</li>
+            </ul>
+
+            <h3>Policy Implementation Details</h3>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// In parallel_scheduler_domain::transform_sender()</span>
+
+<span style="color: #888">// Extract policy from bulk operation</span>
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #333">&amp;&amp;</span> [tag, data, child] <span style="color: #333">=</span> sndr;
+<span style="color: #080; font-weight: bold">auto</span><span style="color: #333">&amp;&amp;</span> [pol, shape, f] <span style="color: #333">=</span> data;
+
+<span style="color: #888">// Determine execution mode at compile time</span>
+<span style="color: #080; font-weight: bold">constexpr</span> <span style="color: #339; font-weight: bold">bool</span> is_parallel <span style="color: #333">=</span> 
+    <span style="color: #333">!</span>is_sequenced_policy_v<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>decay_t<span style="color: #333">&lt;</span><span style="color: #080; font-weight: bold">decltype</span>(pol.__get())<span style="color: #333">&gt;&gt;</span>;
+
+<span style="color: #080; font-weight: bold">constexpr</span> <span style="color: #339; font-weight: bold">bool</span> is_unsequenced <span style="color: #333">=</span> 
+    is_unsequenced_bulk_policy_v<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>decay_t<span style="color: #333">&lt;</span><span style="color: #080; font-weight: bold">decltype</span>(pol.__get())<span style="color: #333">&gt;&gt;</span>;
+
+<span style="color: #888">// Create thread_pool_bulk_sender with policy flags</span>
+<span style="color: #080; font-weight: bold">using</span> fast_sender_t <span style="color: #333">=</span> thread_pool_bulk_sender<span style="color: #333">&lt;</span>
+    hpx<span style="color: #333">::</span>launch, ChildSender, Shape, F,
+    is_chunked, is_parallel, is_unsequenced<span style="color: #333">&gt;</span>;
+</pre>
+            </div>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="task-scheduling">Task Scheduling Flow</h2>
+
+            <h3>Single Task Scheduling</h3>
+            <p>When you call <code>schedule()</code> on the parallel scheduler:</p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #080; font-weight: bold">auto</span> sched <span style="color: #333">=</span> hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+<span style="color: #080; font-weight: bold">auto</span> work <span style="color: #333">=</span> stdexec<span style="color: #333">::</span>schedule(sched) 
+  <span style="color: #333">|</span> stdexec<span style="color: #333">::</span>then([]() { <span style="color: #080; font-weight: bold">return</span> <span style="color: #00D; font-weight: bold">42</span>; });
+stdexec<span style="color: #333">::</span>sync_wait(std<span style="color: #333">::</span>move(work));
+</pre>
+            </div>
+
+            <p><strong>Step-by-step execution:</strong></p>
+            <ol>
+                <li><strong>schedule()</strong> returns a <code>sender&lt;parallel_scheduler&gt;</code></li>
+                <li><strong>connect(receiver)</strong> creates an <code>operation_state&lt;Receiver&gt;</code>:
+                    <ul>
+                        <li>Stores the receiver</li>
+                        <li>Stores <code>shared_ptr&lt;backend&gt;</code></li>
+                        <li>Creates <code>concrete_receiver_proxy</code> wrapping the receiver</li>
+                        <li>Allocates 256-byte storage buffer</li>
+                    </ul>
+                </li>
+                <li><strong>start()</strong> is called on the operation state:
+                    <ul>
+                        <li>Checks <code>stop_token.stop_requested()</code></li>
+                        <li>If stopped: calls <code>set_stopped(receiver)</code> and returns</li>
+                        <li>Otherwise: calls <code>backend_-&gt;schedule(std::span(storage_), proxy_)</code></li>
+                    </ul>
+                </li>
+                <li><strong>Backend schedules work</strong>:
+                    <ul>
+                        <li>Default HPX backend: submits to <code>thread_pool_policy_scheduler</code></li>
+                        <li>Work-stealing thread picks up the task</li>
+                        <li>Executes the task</li>
+                        <li>Calls <code>proxy_.set_value()</code> on completion</li>
+                    </ul>
+                </li>
+                <li><strong>Proxy forwards completion</strong>:
+                    <ul>
+                        <li><code>proxy_.set_value()</code> → <code>stdexec::set_value(receiver_)</code></li>
+                        <li>Receiver processes the value</li>
+                        <li>Chain continues with <code>then()</code> operation</li>
+                    </ul>
+                </li>
+            </ol>
+
+            <h3>Pre-Allocated Storage (Zero-Alloc Contract)</h3>
+            <p>
+                P2079R10 §4.2 requires a zero-allocation contract. The parallel scheduler provides a 256-byte
+                pre-allocated buffer to the backend:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// In operation_state</span>
+alignas(parallel_scheduler_storage_alignment)
+    std<span style="color: #333">::</span>byte storage_[parallel_scheduler_storage_size];  <span style="color: #888">// 256 bytes</span>
+
+<span style="color: #888">// Passed to backend</span>
+backend_<span style="color: #333">-&gt;</span>schedule(std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span>(storage_), proxy_);
+</pre>
+            </div>
+
+            <p><strong>Benefits:</strong></p>
+            <ul>
+                <li>Backends can store small operation states without heap allocation</li>
+                <li>Reduces memory fragmentation</li>
+                <li>Improves cache locality</li>
+                <li>256 bytes is enough for most small task states</li>
+            </ul>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="bulk-operations">Bulk Operations Deep Dive</h2>
+
+            <h3>Chunked vs Unchunked Execution</h3>
+
+            <p><strong>Chunked Mode (<code>bulk_chunked</code>):</strong></p>
+            <ul>
+                <li>Function signature: <code>f(begin, end, ...values)</code></li>
+                <li>Processes ranges of indices in chunks</li>
+                <li>Larger chunk sizes (typically 16 for <code>par</code>)</li>
+                <li>Better cache locality</li>
+                <li>Fewer function calls</li>
+                <li>Best for operations with setup/teardown overhead</li>
+            </ul>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// Chunked bulk operation</span>
+stdexec<span style="color: #333">::</span>schedule(sched)
+  <span style="color: #333">|</span> stdexec<span style="color: #333">::</span>bulk_chunked(stdexec<span style="color: #333">::</span>par, <span style="color: #00D; font-weight: bold">1000</span>, 
+      [](<span style="color: #339; font-weight: bold">size_t</span> begin, <span style="color: #339; font-weight: bold">size_t</span> end) {
+          <span style="color: #888">// Process range [begin, end)</span>
+          <span style="color: #080; font-weight: bold">for</span> (<span style="color: #339; font-weight: bold">size_t</span> i <span style="color: #333">=</span> begin; i <span style="color: #333">&lt;</span> end; <span style="color: #333">++</span>i) {
+              process(i);
+          }
+      });
+</pre>
+            </div>
+
+            <p><strong>Unchunked Mode (<code>bulk_unchunked</code>):</strong></p>
+            <ul>
+                <li>Function signature: <code>f(index, ...values)</code></li>
+                <li>Processes individual indices</li>
+                <li>Smaller chunk sizes (typically 1)</li>
+                <li>Better load balancing for irregular workloads</li>
+                <li>More function calls</li>
+                <li>Best for fine-grained parallel operations</li>
+            </ul>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// Unchunked bulk operation</span>
+stdexec<span style="color: #333">::</span>schedule(sched)
+  <span style="color: #333">|</span> stdexec<span style="color: #333">::</span>bulk_unchunked(stdexec<span style="color: #333">::</span>par, <span style="color: #00D; font-weight: bold">1000</span>, 
+      [](<span style="color: #339; font-weight: bold">size_t</span> i) {
+          <span style="color: #888">// Process single index i</span>
+          process(i);
+      });
+</pre>
+            </div>
+
+            <h3>Chunk Size Strategies</h3>
+            <p>HPX uses different chunking strategies based on the execution mode:</p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// Chunked mode: larger chunks for cache locality</span>
+<span style="color: #080; font-weight: bold">constexpr</span> std<span style="color: #333">::</span>size_t get_bulk_scheduler_chunk_size_chunked() {
+    <span style="color: #080; font-weight: bold">return</span> <span style="color: #00D; font-weight: bold">16</span>;  <span style="color: #888">// Process 16 elements per chunk</span>
+}
+
+<span style="color: #888">// Unchunked mode: fine-grained for load balancing</span>
+<span style="color: #080; font-weight: bold">constexpr</span> std<span style="color: #333">::</span>size_t get_bulk_scheduler_chunk_size_unchunked() {
+    <span style="color: #080; font-weight: bold">return</span> <span style="color: #00D; font-weight: bold">1</span>;   <span style="color: #888">// Process 1 element per chunk</span>
+}
+</pre>
+            </div>
+
+            <h3>Work-Stealing Execution</h3>
+            <p>
+                The fast path uses HPX's work-stealing scheduler with per-thread index queues:
+            </p>
+
+            <pre style="background: #f5f5f5; padding: 1em; border-left: 4px solid #333;">
+Thread Pool (N worker threads)
+  |
+  |-- Thread 0: local_queue [0, 16, 32, ...]
+  |-- Thread 1: local_queue [1, 17, 33, ...]
+  |-- Thread 2: local_queue [2, 18, 34, ...]
+  |-- ...
+  |-- Thread N-1: local_queue [N-1, N+15, N+31, ...]
+  |
+  |-- Work-stealing: When a thread finishes its queue,
+  |                   it steals from other threads' queues
+  |
+  |-- Main thread participation: The calling thread also
+                                  participates in work execution
+</pre>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="domain-transformation">Domain Transformation Pipeline</h2>
+
+            <p>
+                The <code>parallel_scheduler_domain</code> intercepts bulk operations and transforms them
+                to use HPX's optimized execution:
+            </p>
+
+            <h3>Transformation Steps</h3>
+            <ol>
+                <li><strong>Detect bulk operation</strong>:
+                    <ul>
+                        <li>Check if sender is <code>bulk_chunked_t</code> or <code>bulk_unchunked_t</code></li>
+                        <li>Verify it completes on <code>parallel_scheduler</code></li>
+                    </ul>
+                </li>
+                <li><strong>Extract parameters</strong>:
+                    <ul>
+                        <li>Execution policy (<code>seq</code>, <code>par</code>, <code>par_unseq</code>,
+                            <code>unseq</code>)</li>
+                        <li>Shape (number of iterations)</li>
+                        <li>Function to execute</li>
+                        <li>Child sender</li>
+                    </ul>
+                </li>
+                <li><strong>Determine execution mode</strong>:
+                    <ul>
+                        <li><code>is_chunked</code>: from sender tag</li>
+                        <li><code>is_parallel</code>: from policy type</li>
+                        <li><code>is_unsequenced</code>: from policy type</li>
+                    </ul>
+                </li>
+                <li><strong>Check for fast path</strong>:
+                    <ul>
+                        <li>Query <code>get_underlying_scheduler()</code></li>
+                        <li>Query <code>get_pu_mask()</code></li>
+                        <li>If both return non-null: use fast path</li>
+                        <li>Otherwise: use virtual dispatch path</li>
+                    </ul>
+                </li>
+                <li><strong>Create appropriate sender</strong>:
+                    <ul>
+                        <li>Fast path: <code>thread_pool_bulk_sender</code></li>
+                        <li>Virtual path: <code>parallel_bulk_dispatch_sender</code> with virtual data</li>
+                    </ul>
+                </li>
+            </ol>
+
+            <h3>Domain Transformation Code Flow</h3>
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// parallel_scheduler_domain::transform_sender()</span>
+
+<span style="color: #080; font-weight: bold">template</span> <span style="color: #333">&lt;</span>bulk_chunked_or_unchunked_sender Sender, <span style="color: #080; font-weight: bold">typename</span> Env<span style="color: #333">&gt;</span>
+<span style="color: #080; font-weight: bold">auto</span> transform_sender(set_value_t, Sender<span style="color: #333">&amp;&amp;</span> sndr, Env <span style="color: #080; font-weight: bold">const</span><span style="color: #333">&amp;</span> env) <span style="color: #080; font-weight: bold">const</span> {
+    <span style="color: #888">// 1. Extract bulk parameters</span>
+    <span style="color: #080; font-weight: bold">auto</span><span style="color: #333">&amp;&amp;</span> [tag, data, child] <span style="color: #333">=</span> sndr;
+    <span style="color: #080; font-weight: bold">auto</span><span style="color: #333">&amp;&amp;</span> [pol, shape, f] <span style="color: #333">=</span> data;
+    
+    <span style="color: #888">// 2. Get parallel_scheduler from environment</span>
+    <span style="color: #080; font-weight: bold">auto</span> par_sched <span style="color: #333">=</span> get_completion_scheduler<span style="color: #333">&lt;</span>set_value_t<span style="color: #333">&gt;</span>(get_env(child));
+    
+    <span style="color: #888">// 3. Check for fast path availability</span>
+    <span style="color: #080; font-weight: bold">auto</span> <span style="color: #080; font-weight: bold">const</span><span style="color: #333">*</span> underlying_ptr <span style="color: #333">=</span> par_sched.get_underlying_scheduler();
+    <span style="color: #080; font-weight: bold">auto</span> <span style="color: #080; font-weight: bold">const</span><span style="color: #333">*</span> pu_mask_ptr <span style="color: #333">=</span> par_sched.get_pu_mask();
+    
+    <span style="color: #888">// 4. Determine execution modes</span>
+    <span style="color: #080; font-weight: bold">constexpr</span> <span style="color: #339; font-weight: bold">bool</span> is_chunked <span style="color: #333">=</span> <span style="color: #333">!</span>__sender_for<span style="color: #333">&lt;</span>Sender, bulk_unchunked_t<span style="color: #333">&gt;</span>;
+    <span style="color: #080; font-weight: bold">constexpr</span> <span style="color: #339; font-weight: bold">bool</span> is_parallel <span style="color: #333">=</span> <span style="color: #333">!</span>is_sequenced_policy_v<span style="color: #333">&lt;...&gt;</span>;
+    <span style="color: #080; font-weight: bold">constexpr</span> <span style="color: #339; font-weight: bold">bool</span> is_unsequenced <span style="color: #333">=</span> is_unsequenced_bulk_policy_v<span style="color: #333">&lt;...&gt;</span>;
+    
+    <span style="color: #888">// 5. Fast path: create optimized thread_pool_bulk_sender</span>
+    <span style="color: #080; font-weight: bold">if</span> (underlying_ptr <span style="color: #333">!=</span> <span style="color: #080; font-weight: bold">nullptr</span> <span style="color: #333">&amp;&amp;</span> pu_mask_ptr <span style="color: #333">!=</span> <span style="color: #080; font-weight: bold">nullptr</span>) {
+        <span style="color: #080; font-weight: bold">auto</span> fast_sender <span style="color: #333">=</span> thread_pool_bulk_sender<span style="color: #333">&lt;</span>
+            hpx<span style="color: #333">::</span>launch, ChildSender, Shape, F,
+            is_chunked, is_parallel, is_unsequenced<span style="color: #333">&gt;</span>(
+                <span style="color: #333">*</span>underlying_ptr, child, iota_shape, f, <span style="color: #333">*</span>pu_mask_ptr);
+        <span style="color: #080; font-weight: bold">return</span> dispatch_sender{fast_path_data{fast_sender}};
+    }
+    
+    <span style="color: #888">// 6. Virtual path: route through backend virtual methods</span>
+    <span style="color: #080; font-weight: bold">return</span> dispatch_sender{virtual_path_data{
+        par_sched.get_backend(), shape, f, child}};
+}
+</pre>
+            </div>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="fast-vs-virtual">Fast Path vs Virtual Path</h2>
+
+            <h3>Fast Path (Default HPX Backend)</h3>
+            <p>
+                When using the default <code>hpx_parallel_scheduler_backend</code>, bulk operations take the
+                fast path through <code>thread_pool_bulk_sender</code>:
+            </p>
+
+            <pre style="background: #f5f5f5; padding: 1em; border-left: 4px solid #333;">
+Fast Path Execution:
+  1. Domain transformation creates thread_pool_bulk_sender
+  2. connect() creates operation_state with:
+     - Work-stealing index queues (one per thread)
+     - NUMA-aware thread placement
+     - Main thread participation
+  3. start() distributes work across queues:
+     - Thread 0 gets indices [0, chunk_size, 2*chunk_size, ...]
+     - Thread 1 gets indices [1, chunk_size+1, 2*chunk_size+1, ...]
+     - etc.
+  4. Each thread processes its queue
+  5. Work-stealing: idle threads steal from busy threads
+  6. All threads complete → set_value(receiver)
+
+Performance characteristics:
+  ✓ Zero virtual dispatch overhead
+  ✓ Optimized work distribution
+  ✓ NUMA-aware execution
+  ✓ Work-stealing load balancing
+  ✓ Main thread participation
+</pre>
+
+            <h3>Virtual Path (Custom Backends)</h3>
+            <p>
+                When using a custom backend that doesn't provide <code>get_underlying_scheduler()</code>,
+                bulk operations take the virtual path:
+            </p>
+
+            <pre style="background: #f5f5f5; padding: 1em; border-left: 4px solid #333;">
+Virtual Path Execution:
+  1. Domain transformation creates parallel_bulk_dispatch_sender
+  2. connect() creates virtual_parallel_bulk_op (heap-allocated)
+  3. Child sender connects to internal receiver
+  4. start() on child sender
+  5. Child completes with values
+  6. Internal receiver creates concrete_bulk_proxy with:
+     - Function f
+     - Values from child
+     - IsChunked flag
+  7. Calls backend->schedule_bulk_chunked() or schedule_bulk_unchunked()
+  8. Backend executes: proxy.execute(begin, end) for each chunk
+  9. proxy.execute() calls:
+     - If chunked: f(begin, end, ...values) once
+     - If unchunked: f(i, ...values) for each i in [begin, end)
+  10. Backend calls proxy.set_value() when done
+  11. Proxy forwards to receiver
+
+Performance characteristics:
+  ✓ One heap allocation (virtual_parallel_bulk_op)
+  ✓ Virtual dispatch overhead (negligible for bulk work)
+  ✓ Custom backend controls execution strategy
+  ✓ Flexible for different execution models
+</pre>
+
+            <h3>Type-Erased Dispatch Sender</h3>
+            <p>
+                To return a single type from <code>transform_sender</code>, we use a variant-based dispatch sender:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #080; font-weight: bold">template</span> <span style="color: #333">&lt;</span><span style="color: #080; font-weight: bold">typename</span> FastSender, <span style="color: #080; font-weight: bold">typename</span> ChildSender, 
+          <span style="color: #080; font-weight: bold">typename</span> F, <span style="color: #339; font-weight: bold">bool</span> IsChunked<span style="color: #333">&gt;</span>
+<span style="color: #080; font-weight: bold">struct</span> parallel_bulk_dispatch_sender {
+    <span style="color: #080; font-weight: bold">struct</span> fast_path_data { FastSender sender; };
+    <span style="color: #080; font-weight: bold">struct</span> virtual_path_data {
+        shared_ptr<span style="color: #333">&lt;</span>parallel_scheduler_backend<span style="color: #333">&gt;</span> backend;
+        size_t count;
+        F f;
+        ChildSender child;
+    };
+    
+    std<span style="color: #333">::</span>variant<span style="color: #333">&lt;</span>fast_path_data, virtual_path_data<span style="color: #333">&gt;</span> data_;
+    
+    <span style="color: #888">// connect() checks which path and creates appropriate operation_state</span>
+    <span style="color: #080; font-weight: bold">template</span> <span style="color: #333">&lt;</span><span style="color: #080; font-weight: bold">typename</span> Receiver<span style="color: #333">&gt;</span>
+    <span style="color: #080; font-weight: bold">auto</span> connect(Receiver<span style="color: #333">&amp;&amp;</span> rcvr) {
+        <span style="color: #080; font-weight: bold">return</span> std<span style="color: #333">::</span>visit([<span style="color: #333">&amp;</span>](<span style="color: #080; font-weight: bold">auto</span><span style="color: #333">&amp;</span> d) {
+            <span style="color: #080; font-weight: bold">if</span> <span style="color: #080; font-weight: bold">constexpr</span> (is_fast_path_data<span style="color: #333">&lt;</span><span style="color: #080; font-weight: bold">decltype</span>(d)<span style="color: #333">&gt;</span>) {
+                <span style="color: #888">// Fast path: wrap thread_pool_bulk_sender op</span>
+                <span style="color: #080; font-weight: bold">return</span> dispatch_op{make_unique<span style="color: #333">&lt;</span>fast_parallel_bulk_op<span style="color: #333">&gt;</span>(
+                    d.sender, rcvr)};
+            } <span style="color: #080; font-weight: bold">else</span> {
+                <span style="color: #888">// Virtual path: create virtual_parallel_bulk_op</span>
+                <span style="color: #080; font-weight: bold">return</span> dispatch_op{make_unique<span style="color: #333">&lt;</span>virtual_parallel_bulk_op<span style="color: #333">&gt;</span>(
+                    d.backend, d.count, d.f, d.child, rcvr)};
+            }
+        }, data_);
+    }
+};
+</pre>
+            </div>
+
+            <h3>Performance Comparison</h3>
+            <div style="text-align: center; margin: 2em 0;">
+                <table
+                    style="margin: 0 auto; border-collapse: collapse; border: 2px solid #333; background: #f9f9f9; max-width: 800px;">
+                    <tr style="background: #e0e0e0;">
+                        <th style="border: 1px solid #333; padding: 12px;">Aspect</th>
+                        <th style="border: 1px solid #333; padding: 12px;">Fast Path</th>
+                        <th style="border: 1px solid #333; padding: 12px;">Virtual Path</th>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px;">Heap Allocations</td>
+                        <td style="border: 1px solid #333; padding: 12px;">0 (stack-based)</td>
+                        <td style="border: 1px solid #333; padding: 12px;">1 (virtual_parallel_bulk_op)</td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px;">Virtual Dispatch</td>
+                        <td style="border: 1px solid #333; padding: 12px;">None</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Per bulk operation</td>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px;">Work Distribution</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Optimized queues</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Backend-defined</td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px;">Work-Stealing</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Yes</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Backend-dependent</td>
+                    </tr>
+                    <tr>
+                        <td style="border: 1px solid #333; padding: 12px;">NUMA Awareness</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Yes</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Backend-dependent</td>
+                    </tr>
+                    <tr style="background: #f5f5f5;">
+                        <td style="border: 1px solid #333; padding: 12px;">Use Case</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Default HPX backend</td>
+                        <td style="border: 1px solid #333; padding: 12px;">Custom backends</td>
+                    </tr>
+                </table>
+            </div>
+
+            <p>
+                <strong>Key Insight:</strong> For bulk operations processing thousands of elements, the overhead
+                of one heap allocation and virtual dispatch is negligible compared to the actual work performed.
+                This design provides flexibility for custom backends while maintaining optimal performance for
+                the default HPX backend.
+            </p>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2 id="replaceability-api">Replaceability API (P2079R10)</h2>
+
+            <p>
+                One of the key features of P2079R10 is the <strong>replaceability API</strong>, which allows
+                applications to provide custom execution backends while maintaining a standard interface. This
+                enables specialized implementations for different hardware, execution models, or performance
+                requirements.
+            </p>
+
+            <h3>Backend Interface</h3>
+            <p>
+                The <code>parallel_scheduler_backend</code> is an abstract interface that defines the contract
+                for custom backends:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #080; font-weight: bold">class</span> <span style="color: #B06; font-weight: bold">parallel_scheduler_backend</span> {
+<span style="color: #080; font-weight: bold">public</span><span style="color: #333">:</span>
+    <span style="color: #080; font-weight: bold">virtual</span> <span style="color: #333">~</span>parallel_scheduler_backend() <span style="color: #333">=</span> <span style="color: #080; font-weight: bold">default</span>;
+
+    <span style="color: #888">// Schedule a single task</span>
+    <span style="color: #080; font-weight: bold">virtual</span> <span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">schedule</span>(
+        std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span> storage,
+        parallel_scheduler_receiver_proxy<span style="color: #333">&amp;</span> proxy) <span style="color: #333">=</span> <span style="color: #00D; font-weight: bold">0</span>;
+
+    <span style="color: #888">// Schedule bulk operations (chunked mode)</span>
+    <span style="color: #080; font-weight: bold">virtual</span> <span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">schedule_bulk_chunked</span>(
+        std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span> storage,
+        std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> n,
+        parallel_scheduler_bulk_item_receiver_proxy<span style="color: #333">&amp;</span> proxy) <span style="color: #333">=</span> <span style="color: #00D; font-weight: bold">0</span>;
+
+    <span style="color: #888">// Schedule bulk operations (unchunked mode)</span>
+    <span style="color: #080; font-weight: bold">virtual</span> <span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">schedule_bulk_unchunked</span>(
+        std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span> storage,
+        std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> n,
+        parallel_scheduler_bulk_item_receiver_proxy<span style="color: #333">&amp;</span> proxy) <span style="color: #333">=</span> <span style="color: #00D; font-weight: bold">0</span>;
+
+    <span style="color: #888">// Compare backends for equality</span>
+    <span style="color: #080; font-weight: bold">virtual</span> <span style="color: #339; font-weight: bold">bool</span> <span style="color: #06B; font-weight: bold">equal_to</span>(<span style="color: #080; font-weight: bold">const</span> parallel_scheduler_backend<span style="color: #333">&amp;</span> other) <span style="color: #080; font-weight: bold">const</span> <span style="color: #333">=</span> <span style="color: #00D; font-weight: bold">0</span>;
+
+    <span style="color: #888">// Optional: Fast path optimization</span>
+    <span style="color: #080; font-weight: bold">virtual</span> <span style="color: #080; font-weight: bold">const</span> thread_pool_policy_scheduler<span style="color: #333">&lt;</span>hpx<span style="color: #333">::</span>launch<span style="color: #333">&gt;*</span>
+        <span style="color: #06B; font-weight: bold">get_underlying_scheduler</span>() <span style="color: #080; font-weight: bold">const</span> { <span style="color: #080; font-weight: bold">return</span> <span style="color: #080; font-weight: bold">nullptr</span>; }
+
+    <span style="color: #888">// Optional: NUMA mask for thread affinity</span>
+    <span style="color: #080; font-weight: bold">virtual</span> <span style="color: #080; font-weight: bold">const</span> mask_type<span style="color: #333">*</span> <span style="color: #06B; font-weight: bold">get_pu_mask</span>() <span style="color: #080; font-weight: bold">const</span> { <span style="color: #080; font-weight: bold">return</span> <span style="color: #080; font-weight: bold">nullptr</span>; }
+};
+</pre>
+            </div>
+
+            <h3>Custom Backend Example</h3>
+            <p>Here's how to implement a custom backend for specialized execution:</p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #080; font-weight: bold">class</span> <span style="color: #B06; font-weight: bold">my_custom_backend</span> <span style="color: #333">:</span> <span style="color: #080; font-weight: bold">public</span> parallel_scheduler_backend {
+    my_thread_pool pool_;
+
+<span style="color: #080; font-weight: bold">public</span><span style="color: #333">:</span>
+    <span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">schedule</span>(
+        std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span> storage,
+        parallel_scheduler_receiver_proxy<span style="color: #333">&amp;</span> proxy) <span style="color: #080; font-weight: bold">override</span>
+    {
+        <span style="color: #888">// Check if work was cancelled</span>
+        <span style="color: #080; font-weight: bold">if</span> (proxy.stop_requested()) {
+            proxy.set_stopped();
+            <span style="color: #080; font-weight: bold">return</span>;
+        }
+
+        <span style="color: #888">// Submit work to custom thread pool</span>
+        pool_.submit([<span style="color: #333">&amp;</span>proxy]() {
+            <span style="color: #080; font-weight: bold">try</span> {
+                <span style="color: #888">// Do work...</span>
+                proxy.set_value();  <span style="color: #888">// Signal completion</span>
+            } <span style="color: #080; font-weight: bold">catch</span> (...) {
+                proxy.set_error(std<span style="color: #333">::</span>current_exception());
+            }
+        });
+    }
+
+    <span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">schedule_bulk_chunked</span>(
+        std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span> storage,
+        std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> n,
+        parallel_scheduler_bulk_item_receiver_proxy<span style="color: #333">&amp;</span> proxy) <span style="color: #080; font-weight: bold">override</span>
+    {
+        <span style="color: #888">// Divide work into chunks and distribute</span>
+        <span style="color: #080; font-weight: bold">constexpr</span> std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> chunk_size <span style="color: #333">=</span> <span style="color: #00D; font-weight: bold">16</span>;
+        std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> num_chunks <span style="color: #333">=</span> (n <span style="color: #333">+</span> chunk_size <span style="color: #333">-</span> <span style="color: #00D; font-weight: bold">1</span>) <span style="color: #333">/</span> chunk_size;
+
+        <span style="color: #080; font-weight: bold">for</span> (std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> i <span style="color: #333">=</span> <span style="color: #00D; font-weight: bold">0</span>; i <span style="color: #333">&lt;</span> num_chunks; <span style="color: #333">++</span>i) {
+            std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> begin <span style="color: #333">=</span> i <span style="color: #333">*</span> chunk_size;
+            std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> end <span style="color: #333">=</span> std<span style="color: #333">::</span>min(begin <span style="color: #333">+</span> chunk_size, n);
+
+            pool_.submit([<span style="color: #333">&amp;</span>proxy, begin, end]() {
+                proxy.execute(begin, end);  <span style="color: #888">// Process chunk</span>
+            });
+        }
+
+        <span style="color: #888">// Wait for all chunks to complete</span>
+        pool_.wait_all();
+        proxy.set_value();
+    }
+
+    <span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">schedule_bulk_unchunked</span>(
+        std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span> storage,
+        std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> n,
+        parallel_scheduler_bulk_item_receiver_proxy<span style="color: #333">&amp;</span> proxy) <span style="color: #080; font-weight: bold">override</span>
+    {
+        <span style="color: #888">// Fine-grained: each index is a separate task</span>
+        <span style="color: #080; font-weight: bold">for</span> (std<span style="color: #333">::</span><span style="color: #339; font-weight: bold">size_t</span> i <span style="color: #333">=</span> <span style="color: #00D; font-weight: bold">0</span>; i <span style="color: #333">&lt;</span> n; <span style="color: #333">++</span>i) {
+            pool_.submit([<span style="color: #333">&amp;</span>proxy, i]() {
+                proxy.execute(i, i <span style="color: #333">+</span> <span style="color: #00D; font-weight: bold">1</span>);  <span style="color: #888">// Single index</span>
+            });
+        }
+        pool_.wait_all();
+        proxy.set_value();
+    }
+
+    <span style="color: #339; font-weight: bold">bool</span> <span style="color: #06B; font-weight: bold">equal_to</span>(<span style="color: #080; font-weight: bold">const</span> parallel_scheduler_backend<span style="color: #333">&amp;</span> other) <span style="color: #080; font-weight: bold">const</span> <span style="color: #080; font-weight: bold">override</span> {
+        <span style="color: #080; font-weight: bold">return</span> <span style="color: #080; font-weight: bold">this</span> <span style="color: #333">==</span> <span style="color: #333">&amp;</span>other;  <span style="color: #888">// Pointer equality</span>
+    }
+};
+</pre>
+            </div>
+
+            <h3>Backend Factory and Replacement</h3>
+            <p>
+                P2079R10 defines a factory function that applications can replace to provide custom backends:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// Default factory function (returns HPX backend)</span>
+std<span style="color: #333">::</span>shared_ptr<span style="color: #333">&lt;</span>parallel_scheduler_backend<span style="color: #333">&gt;</span>
+<span style="color: #06B; font-weight: bold">query_parallel_scheduler_backend</span>() {
+    <span style="color: #080; font-weight: bold">static</span> <span style="color: #080; font-weight: bold">auto</span> backend <span style="color: #333">=</span> 
+        std<span style="color: #333">::</span>make_shared<span style="color: #333">&lt;</span>hpx_parallel_scheduler_backend<span style="color: #333">&gt;</span>();
+    <span style="color: #080; font-weight: bold">return</span> backend;
+}
+
+<span style="color: #888">// Application replaces the factory at startup</span>
+<span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">set_parallel_scheduler_backend_factory</span>(
+    std<span style="color: #333">::</span>function<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>shared_ptr<span style="color: #333">&lt;</span>parallel_scheduler_backend<span style="color: #333">&gt;</span>()<span style="color: #333">&gt;</span> factory);
+
+<span style="color: #888">// Usage: Install custom backend</span>
+<span style="color: #339; font-weight: bold">int</span> <span style="color: #06B; font-weight: bold">main</span>() {
+    <span style="color: #888">// Replace backend before any parallel work</span>
+    set_parallel_scheduler_backend_factory([]() {
+        <span style="color: #080; font-weight: bold">return</span> std<span style="color: #333">::</span>make_shared<span style="color: #333">&lt;</span>my_custom_backend<span style="color: #333">&gt;</span>();
+    });
+
+    <span style="color: #888">// Now all parallel schedulers use the custom backend</span>
+    <span style="color: #080; font-weight: bold">auto</span> sched <span style="color: #333">=</span> hpx<span style="color: #333">::</span>execution<span style="color: #333">::</span>experimental<span style="color: #333">::</span>get_parallel_scheduler();
+    <span style="color: #888">// ... use sched with custom backend ...</span>
+}
+</pre>
+            </div>
+
+            <h3>Use Cases for Custom Backends</h3>
+            <ul>
+                <li><strong>GPU Execution:</strong> Backend that offloads work to GPU compute kernels</li>
+                <li><strong>Distributed Computing:</strong> Backend that distributes tasks across network nodes</li>
+                <li><strong>Real-Time Systems:</strong> Backend with priority scheduling and deadline guarantees</li>
+                <li><strong>Profiling/Tracing:</strong> Backend that wraps another backend and adds instrumentation</li>
+                <li><strong>Testing:</strong> Mock backend for unit testing parallel algorithms</li>
+                <li><strong>Heterogeneous Systems:</strong> Backend that routes work to different accelerators</li>
+            </ul>
+
+            <h3>Backend Sharing and Equality</h3>
+            <p>
+                The <code>parallel_scheduler</code> stores a <code>shared_ptr&lt;parallel_scheduler_backend&gt;</code>,
+                enabling backend sharing across multiple scheduler instances:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #888">// Multiple schedulers can share the same backend</span>
+<span style="color: #080; font-weight: bold">auto</span> sched1 <span style="color: #333">=</span> get_parallel_scheduler();
+<span style="color: #080; font-weight: bold">auto</span> sched2 <span style="color: #333">=</span> get_parallel_scheduler();
+
+<span style="color: #888">// Equality check uses backend->equal_to()</span>
+<span style="color: #080; font-weight: bold">if</span> (sched1 <span style="color: #333">==</span> sched2) {
+    <span style="color: #888">// Same backend (default HPX implementation shares a singleton)</span>
+}
+
+<span style="color: #888">// Custom backends control equality semantics</span>
+<span style="color: #080; font-weight: bold">class</span> <span style="color: #B06; font-weight: bold">value_based_backend</span> <span style="color: #333">:</span> <span style="color: #080; font-weight: bold">public</span> parallel_scheduler_backend {
+    <span style="color: #339; font-weight: bold">int</span> thread_count_;
+<span style="color: #080; font-weight: bold">public</span><span style="color: #333">:</span>
+    <span style="color: #339; font-weight: bold">bool</span> <span style="color: #06B; font-weight: bold">equal_to</span>(<span style="color: #080; font-weight: bold">const</span> parallel_scheduler_backend<span style="color: #333">&amp;</span> other) <span style="color: #080; font-weight: bold">const</span> <span style="color: #080; font-weight: bold">override</span> {
+        <span style="color: #080; font-weight: bold">auto</span><span style="color: #333">*</span> o <span style="color: #333">=</span> <span style="color: #080; font-weight: bold">dynamic_cast</span><span style="color: #333">&lt;</span><span style="color: #080; font-weight: bold">const</span> value_based_backend<span style="color: #333">*&gt;</span>(<span style="color: #333">&amp;</span>other);
+        <span style="color: #080; font-weight: bold">return</span> o <span style="color: #333">&amp;&amp;</span> o<span style="color: #333">-&gt;</span>thread_count_ <span style="color: #333">==</span> thread_count_;
+    }
+};
+</pre>
+            </div>
+
+            <h3>Pre-Allocated Storage Contract</h3>
+            <p>
+                All backend methods receive a <code>std::span&lt;std::byte&gt;</code> storage buffer (256 bytes)
+                that backends can use for small operation states without heap allocation:
+            </p>
+
+            <div style="background: transparent; overflow:auto;width:auto;border:none;padding:.2em .6em;">
+                <pre style="margin: 0; line-height: 125%;"><span style="color: #339; font-weight: bold">void</span> <span style="color: #06B; font-weight: bold">schedule</span>(std<span style="color: #333">::</span>span<span style="color: #333">&lt;</span>std<span style="color: #333">::</span>byte<span style="color: #333">&gt;</span> storage,
+              parallel_scheduler_receiver_proxy<span style="color: #333">&amp;</span> proxy) <span style="color: #080; font-weight: bold">override</span> {
+    <span style="color: #888">// Option 1: Use storage for small state (zero allocation)</span>
+    <span style="color: #080; font-weight: bold">if</span> (<span style="color: #080; font-weight: bold">sizeof</span>(my_op_state) <span style="color: #333">&lt;=</span> storage.size()) {
+        <span style="color: #080; font-weight: bold">auto</span><span style="color: #333">*</span> op <span style="color: #333">=</span> <span style="color: #080; font-weight: bold">new</span> (storage.data()) my_op_state{<span style="color: #333">...</span>};
+        <span style="color: #888">// ... use op ...</span>
+    }
+    
+    <span style="color: #888">// Option 2: Heap allocate if state is too large</span>
+    <span style="color: #080; font-weight: bold">else</span> {
+        <span style="color: #080; font-weight: bold">auto</span> op <span style="color: #333">=</span> std<span style="color: #333">::</span>make_unique<span style="color: #333">&lt;</span>my_op_state<span style="color: #333">&gt;</span>(<span style="color: #333">...</span>);
+        <span style="color: #888">// ... use op ...</span>
+    }
+}
+</pre>
+            </div>
+
+            <p>
+                <strong>Key Benefits:</strong> The replaceability API provides flexibility without sacrificing
+                performance. The default HPX backend delivers optimal performance through the fast path, while
+                custom backends enable specialized execution strategies for different domains and hardware.
+            </p>
+
+            <hr style="border: none; height: 2px; background: #333; margin: 2em 0;">
+            <h2>Summary</h2>
+            <p>
+                The HPX parallel scheduler implementation demonstrates how to build a high-performance,
+                standards-compliant execution system by:
+            </p>
+            <ul>
+                <li><strong>Reusing existing infrastructure:</strong> Wraps HPX's mature thread pool scheduler</li>
+                <li><strong>Domain-based optimization:</strong> Intercepts bulk operations for fast-path execution</li>
+                <li><strong>Type erasure for flexibility:</strong> Virtual backend interface supports custom
+                    implementations</li>
+                <li><strong>Policy-driven execution:</strong> Four execution policies control parallelism and
+                    vectorization</li>
+                <li><strong>Zero-allocation contract:</strong> Pre-allocated storage for small operation states</li>
+                <li><strong>Dual execution paths:</strong> Fast path for performance, virtual path for flexibility</li>
+            </ul>
+
+            <p style="margin-bottom: 2em; clear: both;">
+                This architecture balances performance, flexibility, and standards compliance, making it
+                suitable for production use while remaining extensible for future enhancements.
+            </p>
+        </section>
+
+        <!-- FOOTER SECTION -->
+        <footer>
+            <p>
+                <small>
+                    <a href="blogpost.html">← Back to Main Article</a><br /><br />
+                    Hosted on GitHub Pages &mdash; Theme by
+                    <a href="https://github.com/orderedlist" target="_blank">orderedlist</a>
+                </small>
+            </p>
+        </footer>
+    </div>
+</body>
+
+</html>
